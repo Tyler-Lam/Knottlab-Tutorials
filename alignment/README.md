@@ -2,7 +2,7 @@
 
 Last updated 5/12/25 - Tyler Lam
 
-These scripts were written initially for the HPV project and heavily adapted from Yoona's alignment code. The raw data, coreograph outputs, h&e stains, and annotation masks are located in the `/common/knottsilab/xenium/hpv` directory. The purpose is to align the dapi images to the h&e stains in order to associate annotated regions with cells in the data.
+These scripts were written initially for the HPV project and are heavily adapted from Yoona's alignment code. The raw data, coreograph outputs, h&e stains, and annotation masks are located in the `/common/knottsilab/xenium/hpv` directory. The purpose is to align the dapi images to the h&e stains in order to associate annotated regions with cells in the data.
 
 ## Scripts
 
