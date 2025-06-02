@@ -86,12 +86,13 @@ def get_X_foundation_model(
             x = (x_centroid - match[0][0] * level_factor) / sf
             y = (y_centroid - match[0][1] * level_factor) / sf
             # Get foundation model of patch containing cell coordinations
-            rep = X[(patch_coords[:,0] <= x) &
-                        (patch_coords[:,0] + 14 > x) &
-                        (patch_coords[:,1] <= y) &
-                        (patch_coords[:,1] + 14 > y) &
-                        (patch_slides == slide) &
-                        (patch_cores == core)]
+            rep = X[
+                (patch_coords[:,0] <= x) &
+                (patch_coords[:,0] + 14 > x) &
+                (patch_coords[:,1] <= y) &
+                (patch_coords[:,1] + 14 > y) &
+                (patch_slides == slide) &
+                (patch_cores == core)]
             # If no core found, return nans
             if (len(rep) == 0):
                 res[i] = np.full(X.shape[1], np.nan)
