@@ -96,7 +96,7 @@ for sid in runlist:
     print (f'read in tiff files in {(time.time() - t0)/60:.2f} min')
     
     # Get cropping coords for the DAPI image
-    crop_idx = df_idx_slides.iloc[sid] # scale factor since cropping coordinates are for level 5 and alignment is level 0
+    crop_idx = df_idx_slides.iloc[sid]
     crop_idx = crop_idx.astype('int')
 
     t0 = time.time()
@@ -107,13 +107,13 @@ for sid in runlist:
 
     arr_he = arr_he[arr_he.shape[0] - crop_idx.x1:arr_he.shape[0] - crop_idx.x0, crop_idx.y0:crop_idx.y1]
 
-    # Scale by 1.2 but scale transformations by extra factor of 2 (recall we scaled by 0.6 to get the slide alignment)
+    # Rrecall we scaled by 0.6 to get the slide alignment
     arr_he = rescale(arr_he.astype('float32'), 0.6, anti_aliasing=False, order=0) 
     
     del image_dapi_lv0, image_he_lv0
     gc.collect()
         
-    # Invert the dapi image (idk why need to ask Yoona again)
+    # Invert the dapi image
     arr_dapi = (arr_dapi - np.min(arr_dapi)) / (np.max(arr_dapi)- np.min(arr_dapi)) * 255
     arr_dapi = 255 - arr_dapi
     
@@ -122,7 +122,7 @@ for sid in runlist:
 
     print(f'preprocessing is done: {(t1-t0)/60:.2f} min')
     
-    # Read in the alignment transformations and adjust for level 0
+    # Read in the alignment transformations
     modelnm = f'/common/lamt2/HPV/data/xenium/alignment/transformations/tfm_{slide.split('/')[1]}.hdf'
     outTx_ogto0 = sitk.ReadTransform(modelnm)
 
