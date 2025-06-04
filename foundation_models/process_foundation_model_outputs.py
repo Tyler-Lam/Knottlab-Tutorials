@@ -48,10 +48,9 @@ def unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features):
     patch_coords = np.vstack([patch_coords] * patch_features.shape[0])
     coords_out = patch_coords + parent_coords
 
-    cls = np.repeat(tile_features[:,:tile_features.shape[1]//2], [patch_features.shape[1] for _ in range(patch_features.shape[0])], axis = 0)
+    cls = np.repeat(tile_features[:,:tile_features.shape[1]//2], [patch_features.shape[1] for _ in range(tile_features.shape[0])], axis = 0)
     features_out = np.vstack(patch_features) #patch_features.reshape(patch_features.shape[0] * patch_features.shape[1], -1)
     features_out = np.concat((features_out, cls), axis = 1)
-        
     return (coords_out, features_out, parent_coords)
 
 # Convert h5 to h5ad, calculate frac background for each patch, and merge
@@ -100,7 +99,7 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
                     patch_features= file['patch_embeddings'][()]
                     patch_coords = file['internal_patch_coords'][()]
                     num_records = patch_features.shape[0] * patch_features.shape[1]
-                    features, coords, parent_coords = unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features)
+                    coords, features, parent_coords = unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features)
 
                     patch_idx = np.array([[f'patch_{i}_tile_{j}_{file_name.replace('.h5', '')}' for i in range(patch_features.shape[1])] for j in range(patch_features.shape[0])]).reshape(features.shape[0], -1)
                     # Create an AnnData object
