@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import matplotlib.patches as patches
 import time
+import sys
+import gc
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -33,13 +35,24 @@ pixels_per_patch = args['patch_len']
 model = args['model']
 slide = args['slide']
 
-
 # Given coords of patch corners and polygon defining tissue segmentation
 # calculate the fraction of each patch that is within the segmentation
 def get_frac_background(x0, y0, x1, y1, segmentation):
     patch = box(x0, y0, x1, y1)
     intersect = patch.intersection(segmentation)
     return (intersect.area / patch.area)
+
+# Flatten features and coordinates when using small patch embeddings
+def unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features):
+    parent_coords = np.repeat(tile_coords, [patch_features.shape[1] for _ in range(patch_features.shape[0])], axis = 0)
+    patch_coords = np.vstack([patch_coords] * patch_features.shape[0])
+    coords_out = patch_coords + parent_coords
+
+    cls = np.repeat(tile_features[:,:tile_features.shape[1]//2], [patch_features.shape[1] for _ in range(patch_features.shape[0])], axis = 0)
+    features_out = np.vstack(patch_features) #patch_features.reshape(patch_features.shape[0] * patch_features.shape[1], -1)
+    features_out = np.concat((features_out, cls), axis = 1)
+        
+    return (coords_out, features_out, parent_coords)
 
 # Convert h5 to h5ad, calculate frac background for each patch, and merge
 def create_anndata_from_h5_files_with_segmentation(directory_path):
@@ -79,56 +92,36 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
                 
                 # If we have the patch information, use the patches as the rows in the anndata
                 if 'coords' in file and 'features' in file and 'internal_patch_coords' in file and 'patch_embeddings' in file:
-                    
                     # Properties of full tiles
                     tile_coords = file['coords'][()]
                     tile_features = file['features'][()]
-                    tile_xs = [x[0] for x in tile_coords]
-                    tile_ys = [x[1] for x in tile_coords]
-                    tile_idx = [f"tile_{i}_{file_name.replace('.h5', '')}" for i in range(tile_coords.shape[0])]
 
                     # Properties of patches
-                    patch_coords = file['internal_patch_coords'][()]
                     patch_features= file['patch_embeddings'][()]
-                    patch_xs = np.array([])
-                    patch_ys = np.array([])
-                    parent_xs = np.array([]) # Coordinate of parent tile
-                    parent_ys = np.array([]) # Coordinate of parent tile
-                    features = np.empty((0, patch_features.shape[2] + tile_features.shape[1]//2))
-                    # Create an index for this file's data
-                    #patch_idx = [f"patch_{i}_{file_name.replace('.h5', '')}" for i in range(patch_features.shape[0] * patch_features.shape[1])]
-                    patch_idx = []
-                    parent_idx = []
-                    num_records = len(patch_idx)
-                    # Loop over tiles
-                    for i in range(tile_coords.shape[0]):
-                        patch_idx = patch_idx + [f'tile_{i}_patch_{j}_{file_name.replace('.h5', '')}' for j in range(patch_features.shape[1])]
-                        tile_feats = tile_features[i][:len(tile_features[i])//2]
-                        feats = np.array([np.concatenate((tile_feats, f)) for f in patch_features[i]])
-                        features = np.concatenate((features, feats))
-                        
-                        x = tile_coords[i][0]
-                        y = tile_coords[i][1]
-                        patch_xs = np.concatenate((patch_xs, np.full(patch_coords.shape[0], x) + patch_coords[:,0]))
-                        patch_ys = np.concatenate((patch_ys, np.full(patch_coords.shape[0], y) + patch_coords[:,1]))
-                        parent_xs = np.concatenate((parent_xs, np.full(patch_coords.shape[0], x)))
-                        parent_ys = np.concatenate((parent_ys, np.full(patch_coords.shape[0], y)))
-                        
-                        parent_idx = np.concatenate((parent_idx, np.full(patch_coords.shape[0], tile_idx[i])))
+                    patch_coords = file['internal_patch_coords'][()]
+                    num_records = patch_features.shape[0] * patch_features.shape[1]
+                    features, coords, parent_coords = unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features)
 
+                    patch_idx = np.array([[f'patch_{i}_tile_{j}_{file_name.replace('.h5', '')}' for i in range(patch_features.shape[1])] for j in range(patch_features.shape[0])]).reshape(features.shape[0], -1)
                     # Create an AnnData object
                     adata = ad.AnnData(
                         X=features,
-                        obs=pd.DataFrame({'x0': patch_xs, 'y0': patch_ys, 'parent_x0': parent_xs, 'parent_y0': parent_ys, 'parent_idx': parent_idx}, index=patch_idx),
+                        obs = pd.DataFrame({'x0': coords[:,0], 'y0': coords[:,1], 'parent_x0': parent_coords[:,0], 'parent_y0': parent_coords[:,1]}, index = patch_idx)
                     )
                     
+                    del features, coords, parent_coords#, patch_idx
+                    gc.collect()
                     adata.obs['batch'] = file_name.split('/')[-1].split('.')[0]
                     adata.obs['core'] = adata.obs['batch'].apply(lambda x: x.split('___')[1])
                     adata.obs['slide'] = adata.obs['batch'].apply(lambda x: x.split('___')[0])
+                    
                     for annot in segmentation:
-                        adata.obs[f'frac_{annot}'] = adata.obs.apply(lambda x: get_frac_background(x['x0'], x['y0'], x['x0'] + pixels_per_patch, x['y0'] + pixels_per_patch, segmentation[annot]), axis = 1)
-                        adata.obs[f'parent_frac_{annot}'] = adata.obs.apply(lambda x: get_frac_background(x['parent_x0'], x['parent_y0'], x['parent_x0'] + tile_len, x['parent_y0'] + tile_len, segmentation[annot]), axis = 1)
+                        #adata.obs[f'frac_{annot}'] = adata.obs.apply(lambda x: get_frac_background(x['x0'], x['y0'], x['x0'] + pixels_per_patch, x['y0'] + pixels_per_patch, segmentation[annot]), axis = 1)
+                        #adata.obs[f'parent_frac_{annot}'] = adata.obs.apply(lambda x: get_frac_background(x['parent_x0'], x['parent_y0'], x['parent_x0'] + tile_len, x['parent_y0'] + tile_len, segmentation[annot]), axis = 1)
 
+                        adata.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(adata.obs['x0'], adata.obs['y0'], adata.obs['x0'] + pixels_per_patch, adata.obs['y0'] + pixels_per_patch, segmentation[annot])
+                        adata.obs[f'parent_frac_{annot}'] = np.vectorize(get_frac_background)(adata.obs['parent_x0'], adata.obs['parent_y0'], adata.obs['parent_x0'] + tile_len, adata.obs['parent_y0'] + tile_len, segmentation[annot])
+                    
                     anndata_objects.append(adata)
                     del adata
                 
@@ -160,7 +153,10 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
                 else:
                     print(f"Warning: '{file_name}' doesn't contain both 'coords' and 'features' datasets")
         except Exception as e:
-            print(f"Error processing '{file_name}': {e}")
+            print(f"Error processing '{file_name}'")
+            import traceback
+            err = traceback.format_exc()
+            print(err)
     print('Finished converting h5 files')
     if not anndata_objects:
         print("No valid data found in any of the H5 files")
@@ -187,7 +183,7 @@ for col in adata.obs.columns:
     adata.obs[col] = adata.obs[col].replace(np.nan, 0)
 
 # Filter based on virchow2 training criteria
-adata = adata[(adata.obs['parent_frac_tissue'] > 0.65) & (adata.obs['parent_frac_fold'] < 0.35)]
+#adata = adata[(adata.obs['parent_frac_tissue'] > 0.65) & (adata.obs['parent_frac_fold'] < 0.35)]
 
 # If no overlap, save anndata
 if overlap == 0:
@@ -225,8 +221,8 @@ else:
                     adata_agg.obs['core'] = batch.split('___')[-1]
 
                     for annot in segmentation:
-                        adata_agg.obs[f'frac_{annot}'] = adata_agg.obs.apply(lambda x: get_frac_background(x['x0'], x['y0'], x['x0'] + pixels_per_patch, x['y0'] + pixels_per_patch, segmentation[annot]), axis = 1)
-                        adata_agg.obs[f'frac_{annot}'] = adata_agg.obs[f'frac_{annot}'].replace(np.nan, 0)
+                        #adata_agg.obs[f'frac_{annot}'] = adata_agg.obs.apply(lambda x: get_frac_background(x['x0'].astype(int), x['y0'].astype(int), x['x0'].astype(int) + pixels_per_patch, x['y0'].astype(int) + pixels_per_patch, segmentation[annot]), axis = 1)
+                        adata_agg.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(adata_agg.obs['x0'].astype(int), adata_agg.obs['y0'].astype(int), adata_agg.astype(int).obs['x0'] + pixels_per_patch, adata_agg.obs['y0'].astype(int) + pixels_per_patch, segmentation[annot])
                     adata_per_batch.append(adata_agg)
 
                 # If we only have tile information, re-segment using geometry of the tiles
@@ -292,14 +288,16 @@ else:
                     tmp.obs['slide'] = batch.split('___')[0]
                     tmp.obs['core'] = batch.split('___')[-1]
                     for annot in segmentation:
+                        #tmp.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(tmp.obs['x0'], tmp.obs['y0'], tmp.obs['x1'], tmp.obs['y1'], segmentation[annot])
                         tmp.obs[f'frac_{annot}'] = tmp.obs.apply(lambda x: get_frac_background(x['x0'], x['y0'], x['x1'], x['y1'], segmentation[annot]), axis = 1)
-                        tmp.obs[f'frac_{annot}'] = tmp.obs[f'frac_{annot}'].replace(np.nan, 0)
 
                     adata_per_batch.append(tmp)
                     
             except Exception as e:
-                print (f'Error processing batch {batch}: {e}')
-                
+                print(f"Error processing '{batch}'")
+                import traceback
+                err = traceback.format_exc()
+                print(err)                
         try:
             out = ad.concat(
                 adata_per_batch,
