@@ -1,4 +1,4 @@
-# Notebook to merge outputs from foundation models, converting from .h5 to .h5ad files
+# Notebook to merge outputs from foundation models, converting from .h5 to .h5ad files, then apply the output to the xenium data
 import h5py
 from pathlib import Path
 import os
@@ -35,6 +35,12 @@ pixels_per_patch = args['patch_len']
 model = args['model']
 slide = args['slide']
 
+import warnings
+import anndata
+
+# Filter out the "switching to string index" warning that messes with tqdm
+warnings.filterwarnings('ignore', category=anndata.ImplicitModificationWarning) 
+
 # Given coords of patch corners and polygon defining tissue segmentation
 # calculate the fraction of each patch that is within the segmentation
 def get_frac_background(x0, y0, x1, y1, segmentation):
@@ -47,11 +53,26 @@ def unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features):
     parent_coords = np.repeat(tile_coords, [patch_features.shape[1] for _ in range(patch_features.shape[0])], axis = 0)
     patch_coords = np.vstack([patch_coords] * patch_features.shape[0])
     coords_out = patch_coords + parent_coords
-
+    
+    # Weight based on contribution of each patch to the aggregate of overlapping tiles
+    # Equivalently, the weight is equal to the area between the patch and the closest tile corner
+    # This only works for 50% overlap, need to generalize for different fractions
+    if tile_len / overlap == 2:
+        patch_midpoint = coords_out + [pixels_per_patch/2, pixels_per_patch/2]
+        delta_xy1 = patch_midpoint - parent_coords
+        delta_xy2 = tile_len + parent_coords - patch_midpoint
+        
+        delta_xy = np.minimum(delta_xy1, delta_xy2)
+        
+        weights = delta_xy[:,0] * delta_xy[:,1]
+    else:
+        weights = np.ones(len(coords_out))
+    
     cls = np.repeat(tile_features[:,:tile_features.shape[1]//2], [patch_features.shape[1] for _ in range(tile_features.shape[0])], axis = 0)
-    features_out = np.vstack(patch_features) #patch_features.reshape(patch_features.shape[0] * patch_features.shape[1], -1)
+    features_out = np.vstack(patch_features) 
     features_out = np.concat((features_out, cls), axis = 1)
-    return (coords_out, features_out, parent_coords)
+    return (coords_out, features_out, parent_coords, weights)
+
 
 # Convert h5 to h5ad, calculate frac background for each patch, and merge
 def create_anndata_from_h5_files_with_segmentation(directory_path):
@@ -72,11 +93,12 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
     anndata_objects = []
         
     # Process each H5 file
-    for file_path in tqdm.tqdm(h5_files):
+    for file_path in (pbar := tqdm.tqdm(h5_files)):
         file_name = os.path.basename(file_path)  # Get the filename without path
         try:
             with h5py.File(file_path, 'r') as file:
                 
+                pbar.set_description("Getting segmentation from geojson")
                 # Read in segmentation from the geojson and make the polygons:
                 json_file = open(f'/common/lamt2/HPV/data/foundation_models/segmentation/{file_path.split('/')[-1].replace('.h5', '')}.geojson')
                 data = json.load(json_file)
@@ -88,7 +110,6 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
                         segmentation[feature['properties']['classification']['name']] = segmentation[feature['properties']['classification']['name']].union(feat_shape)
                         
                 # Read the coords and features dataset
-                
                 # If we have the patch information, use the patches as the rows in the anndata
                 if 'coords' in file and 'features' in file and 'internal_patch_coords' in file and 'patch_embeddings' in file:
                     # Properties of full tiles
@@ -98,27 +119,31 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
                     # Properties of patches
                     patch_features= file['patch_embeddings'][()]
                     patch_coords = file['internal_patch_coords'][()]
+                    
                     num_records = patch_features.shape[0] * patch_features.shape[1]
-                    coords, features, parent_coords = unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features)
-
-                    patch_idx = np.array([[f'patch_{i}_tile_{j}_{file_name.replace('.h5', '')}' for i in range(patch_features.shape[1])] for j in range(patch_features.shape[0])]).reshape(features.shape[0], -1)
+                    
+                    pbar.set_description("Unpacking h5 file")
+                    coords, features, parent_coords, weights = unpack_h5_file(tile_coords, tile_features, patch_coords, patch_features)
+                    patch_idx = [f'patch_{i}_tile_{j}_{file_name.replace('.h5', '')}' for j in range(patch_features.shape[0]) for i in range(patch_features.shape[1]) ]
+                    #patch_idx = np.array([[f'patch_{i}_tile_{j}_{file_name.replace('.h5', '')}' for i in range(patch_features.shape[1])] for j in range(patch_features.shape[0])]).reshape(features.shape[0], -1)
                     # Create an AnnData object
                     adata = ad.AnnData(
                         X=features,
-                        obs = pd.DataFrame({'x0': coords[:,0], 'y0': coords[:,1], 'parent_x0': parent_coords[:,0], 'parent_y0': parent_coords[:,1]}, index = patch_idx)
+                        obs = pd.DataFrame({'x0': coords[:,0], 'y0': coords[:,1], 'parent_x0': parent_coords[:,0], 'parent_y0': parent_coords[:,1], 'weight_raw': weights}, index = patch_idx)
                     )
                     
-                    del features, coords, parent_coords#, patch_idx
+                    del features, coords, parent_coords, patch_idx
                     gc.collect()
+                    
                     adata.obs['batch'] = file_name.split('/')[-1].split('.')[0]
                     adata.obs['core'] = adata.obs['batch'].apply(lambda x: x.split('___')[1])
                     adata.obs['slide'] = adata.obs['batch'].apply(lambda x: x.split('___')[0])
-                    
+                    pbar.set_description("Calculating fractions from segmentation")
                     for annot in segmentation:
                         #adata.obs[f'frac_{annot}'] = adata.obs.apply(lambda x: get_frac_background(x['x0'], x['y0'], x['x0'] + pixels_per_patch, x['y0'] + pixels_per_patch, segmentation[annot]), axis = 1)
                         #adata.obs[f'parent_frac_{annot}'] = adata.obs.apply(lambda x: get_frac_background(x['parent_x0'], x['parent_y0'], x['parent_x0'] + tile_len, x['parent_y0'] + tile_len, segmentation[annot]), axis = 1)
 
-                        adata.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(adata.obs['x0'], adata.obs['y0'], adata.obs['x0'] + pixels_per_patch, adata.obs['y0'] + pixels_per_patch, segmentation[annot])
+                        #adata.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(adata.obs['x0'], adata.obs['y0'], adata.obs['x0'] + pixels_per_patch, adata.obs['y0'] + pixels_per_patch, segmentation[annot])
                         adata.obs[f'parent_frac_{annot}'] = np.vectorize(get_frac_background)(adata.obs['parent_x0'], adata.obs['parent_y0'], adata.obs['parent_x0'] + tile_len, adata.obs['parent_y0'] + tile_len, segmentation[annot])
                     
                     anndata_objects.append(adata)
@@ -175,57 +200,41 @@ def create_anndata_from_h5_files_with_segmentation(directory_path):
 
 print('Translating h5 files to h5ad files')
 adata = create_anndata_from_h5_files_with_segmentation(directory_path=f'/common/lamt2/HPV/data/foundation_models/{model}/20x_{tile_len}px_{overlap}px_overlap/features_{model}/')
-print('...done')
 
 # Replace nan with 0
 for col in adata.obs.columns:
     adata.obs[col] = adata.obs[col].replace(np.nan, 0)
 
 # Filter based on virchow2 training criteria
-#adata = adata[(adata.obs['parent_frac_tissue'] > 0.65) & (adata.obs['parent_frac_fold'] < 0.35)]
+if 'parent_frac_fold' in adata.obs.columns:
+    adata = adata[(adata.obs['parent_frac_tissue'] > 0.65) & (adata.obs['parent_frac_fold'] < 0.35)]
+else:
+    adata = adata[(adata.obs['parent_frac_tissue'] > 0.65)]
 
-# If no overlap, save anndata
-if overlap == 0:
-    adata.write(f'/common/lamt2/HPV/data/foundation_models/{model}/20x_{tile_len}px_{overlap}px_overlap/h5ad_files/{slide}_combined.h5ad')
-    print('---done---')
+# Normalize patch weights
+adata.obs['weight'] = adata.obs.groupby(['x0', 'y0', 'core'])['weight_raw'].transform(lambda x: x/x.sum())
 
 # If overlap, re-segment patches by averaging overlapping tiles
-else:
+if overlap != 0:
     def resegment_h5ad(adata):
-        adata_per_batch = []
-        for batch in tqdm.tqdm(adata.obs['batch'].unique()):
-            try:
-                # Read in segmentation from the geojson and make the polygon:
-                json_file = open(f'/common/lamt2/HPV/data/foundation_models/segmentation/{batch}.geojson')
-                data = json.load(json_file)
-                segmentation = defaultdict(Polygon)
-                for feature in data['features']:
-                    coords = feature['geometry']['coordinates']
-                    for coord in coords:
-                        feat_shape = Polygon(coord)
-                        segmentation[feature['properties']['classification']['name']] = segmentation[feature['properties']['classification']['name']].union(feat_shape)
-                        
-                # If we have patch information, use patches
-                # This assumes that overlap is an integer multiple of the patch length, otherwise this doesn't work
-                if 'parent_x0' in adata.obs.columns and 'parent_y0' in adata.obs.columns:
-                    
-                    # Use scanpy to aggregate patches with the same coordinates
-                    adata_agg = sc.get.aggregate(adata[adata.obs['batch'] == batch], by = ['x0', 'y0'], func = 'mean')
-                    adata_agg.X = adata_agg.layers['mean']
-                    idx = [f'patch_{i}_{batch}' for i in range(len(adata_agg))]
-                    adata_agg.obs['patch'] = idx
-                    adata_agg.obs.set_index('patch')
-                    adata_agg.obs['batch'] = batch
-                    adata_agg.obs['slide'] = batch.split('___')[0]
-                    adata_agg.obs['core'] = batch.split('___')[-1]
-
-                    for annot in segmentation:
-                        #adata_agg.obs[f'frac_{annot}'] = adata_agg.obs.apply(lambda x: get_frac_background(x['x0'].astype(int), x['y0'].astype(int), x['x0'].astype(int) + pixels_per_patch, x['y0'].astype(int) + pixels_per_patch, segmentation[annot]), axis = 1)
-                        adata_agg.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(adata_agg.obs['x0'].astype(int), adata_agg.obs['y0'].astype(int), adata_agg.astype(int).obs['x0'] + pixels_per_patch, adata_agg.obs['y0'].astype(int) + pixels_per_patch, segmentation[annot])
-                    adata_per_batch.append(adata_agg)
-
+        if 'parent_x0' in adata.obs.columns and 'parent_y0' in adata.obs.columns:
+            X_weighted = adata.X * np.vstack(adata.obs['weight'])
+            adata.X = X_weighted
+            adata_agg = sc.get.aggregate(adata, by = ['x0', 'y0', 'core'], func = 'sum')
+            adata_agg.X = adata_agg.layers['sum']
+            adata_agg.obs['slide'] = slide
+            adata_agg.obs.reset_index()
+            patch_idx = adata_agg.obs.groupby('core', observed = False).cumcount()
+            adata_agg.obs['patch_idx'] = patch_idx
+            adata_agg.obs['batch'] = adata_agg.obs['slide'].astype(str) + '___' + adata_agg.obs['core'].astype(str) + '___' + adata_agg.obs['patch_idx'].astype(str)
+            adata_agg.obs.set_index('batch', inplace = True)
+            return adata_agg
+        
+        else:
+            adata_per_batch = []
+            for batch in (pbar := tqdm.tqdm(adata.obs['batch'].unique(), desc = "Resegmenting anndata patches")):
+                try:
                 # If we only have tile information, re-segment using geometry of the tiles
-                else:
                     xys = adata[adata.obs['batch'] == batch].obs[['x0', 'y0']]
                     
                     # Construct line segments for all tiles:
@@ -286,35 +295,119 @@ else:
                     tmp.obs['batch'] = batch
                     tmp.obs['slide'] = batch.split('___')[0]
                     tmp.obs['core'] = batch.split('___')[-1]
-                    for annot in segmentation:
-                        #tmp.obs[f'frac_{annot}'] = np.vectorize(get_frac_background)(tmp.obs['x0'], tmp.obs['y0'], tmp.obs['x1'], tmp.obs['y1'], segmentation[annot])
-                        tmp.obs[f'frac_{annot}'] = tmp.obs.apply(lambda x: get_frac_background(x['x0'], x['y0'], x['x1'], x['y1'], segmentation[annot]), axis = 1)
 
                     adata_per_batch.append(tmp)
                     
+                except Exception as e:
+                    print(f"Error processing '{batch}'")
+                    import traceback
+                    err = traceback.format_exc()
+                    print(err)                
+            try:
+                out = ad.concat(
+                    adata_per_batch,
+                    join = 'outer',
+                )
             except Exception as e:
-                print(f"Error processing '{batch}'")
-                import traceback
-                err = traceback.format_exc()
-                print(err)                
-        try:
-            out = ad.concat(
-                adata_per_batch,
-                join = 'outer',
-            )
-        except Exception as e:
-            print (f'Error concatenating anndata: {e}')
-        return out
-
+                print (f'Error concatenating anndata: {e}')
+            return out
+    t0 = time.time()
     print("Resegmenting adata from overlapping tiles")
-    adata_resegmented = resegment_h5ad(adata)
-    print('...done')
-    # Replace nan with 0
-    for col in adata_resegmented.obs.columns:
-        adata_resegmented.obs[col] = adata_resegmented.obs[col].replace(np.nan, 0)
+    adata = resegment_h5ad(adata)
+    print(f"...done: {(time.time() - t0)/60:.2f} min")
+    
+# Associate xenium slide name to h&e slide name
+anno_dict = {
+    '20250213__202616__X206_02132025_ANOGENTMA_1_2/output-XETG00206__0060075__Region_1__20250213__202651': 'ag_hpv_01',
+    '20250213__202616__X206_02132025_ANOGENTMA_1_2/output-XETG00206__0060077__Region_1__20250213__202651': 'ag_hpv_02',
+    '20250224__233848__X206_2242025_ANOGENTMA_03_04/output-XETG00206__0060354__Region_1__20250224__233922': 'ag_hpv_04',
+    '20250224__233848__X206_2242025_ANOGENTMA_03_04/output-XETG00206__0060367__Region_1__20250224__233922': 'ag_hpv_03',
+    '20250304__005745__X403_03032025_ANOGENTMA_05_06/output-XETG00403__0059911__Region_1__20250304__005817': 'ag_hpv_06',
+    '20250304__005745__X403_03032025_ANOGENTMA_05_06/output-XETG00403__0060395__Region_1__20250304__005817': 'ag_hpv_05',
+    '20250305__223640__X206_03052025_HPVTMA_01_02/output-XETG00206__0060364__Region_1__20250305__223715': 'ag_hpv_08',
+    '20250305__223640__X206_03052025_HPVTMA_01_02/output-XETG00206__0060366__Region_1__20250305__223715': 'ag_hpv_07',
+    '20250312__003942__X206_03112025_HPVTMA_03_04/output-XETG00206__0060488__Region_1__20250312__004017': 'ag_hpv_09',
+    '20250312__003942__X206_03112025_HPVTMA_03_04/output-XETG00206__0060493__Region_1__20250312__004017': 'ag_hpv_10'
+}
 
-    adata_resegmented = adata_resegmented[(adata_resegmented.obs['frac_tissue'] > .65) & (adata_resegmented.obs['frac_fold'] < .35)]
+t0 = time.time()
+print("Reading xenium anndata .... ", end = '')
+adata_xenium = sc.read_h5ad('/common/lamt2/HPV/data/xenium/adata/adata_qc.h5ad')
 
-    adata_resegmented.write(f'/common/lamt2/HPV/data/foundation_models/{model}/20x_{tile_len}px_{overlap}px_overlap/h5ad_files/{slide}_combined.h5ad')
+# Cropping coordinate and pixel conversions
+df_idx = pd.read_csv('/common/lamt2/HPV/data/xenium/alignment_v2/cropped_cores.csv', index_col = 0)
+sf = 0.525548 # micron per pixel for foundation model coords (Assuming 20x magnification for h&e images)
+level_factor = 3.4 # microns per pixel for cropping coords (Assuming coords calculated on level 4 dapi)
 
-    print('---done---')
+# Filter to only include the current slide
+adata_xenium.obs['slide_idx'] = adata_xenium.obs['slide'].map(anno_dict)
+ad_slide = adata_xenium[adata_xenium.obs['slide_idx'] == slide]
+df_idx['slide_idx'] = df_idx['slide'].map(anno_dict)
+df_idx = df_idx[df_idx['slide_idx'] == slide]
+
+print(f"done: {(time.time() - t0)/60:.2f} min")
+
+# Function to find foundation model patch based on x-y cell coordinate, and return the foundation model representation
+# Try using numba njit and prange to make looping over arrays faster
+# Takes all inputs as arrays from the pandas dataframe
+from numba import njit, prange, get_num_threads
+@njit(parallel = True)
+def get_X_foundation_model(
+    xs, ys, cores, # Taken from the xenium data
+    crop_coords, crop_core, # Taken from the cropping coordinate dataframe
+    patch_coords, patch_cores, X # Taken from the merged foundation model outputs
+    ):
+    
+    res = np.empty((len(xs), X.shape[1]), dtype = np.float32) #Allocate output array
+    
+    # Loop over cells
+    for i in prange(len(xs)):
+        x_centroid = xs[i]
+        y_centroid = ys[i]
+        core = cores[i]
+        
+        # Get cropping coords
+        match = crop_coords[(crop_core == core)]
+        # If no match: return empty array of nans
+        if len(match) == 0:
+            res[i] = np.full(X.shape[1], np.nan)
+        else:
+            # Get cell coordinates in pixel coordinates
+            x = (x_centroid - match[0][0] * level_factor) / sf
+            y = (y_centroid - match[0][1] * level_factor) / sf
+            # Get foundation model of patch containing cell coordinations
+            rep = X[
+                (patch_coords[:,0] <= x) &
+                (patch_coords[:,0] + 14 > x) &
+                (patch_coords[:,1] <= y) &
+                (patch_coords[:,1] + 14 > y) &
+                (patch_cores == core)]
+            # If no core found, return nans
+            if (len(rep) == 0):
+                res[i] = np.full(X.shape[1], np.nan)
+            # Otherwise return foundation model features
+            else:
+                res[i] = rep[0].astype(np.float32)
+    return res
+
+# Get foundation model features for each cell
+t0 = time.time()
+print(f"Transferring foundation model to cells (using {get_num_threads()} threads).... ", end = '')
+
+X_model = get_X_foundation_model(
+    ad_slide.obs['x_centroid'].to_numpy(dtype=np.int64), 
+    ad_slide.obs['y_centroid'].to_numpy(dtype=np.int64), 
+    ad_slide.obs['core_idx'].to_numpy(dtype=np.int64), 
+    df_idx[['x0', 'y0']].to_numpy(dtype=np.int64), 
+    df_idx['core'].to_numpy(dtype=np.int64), 
+    adata.obs[['x0', 'y0']].to_numpy(dtype=np.int64), 
+    adata.obs['core'].to_numpy(dtype=np.int64), 
+    adata.X)
+
+print(f'done: {(time.time() - t0)/60:.2f} min')
+t0 = time.time()
+print("Saving feature matrix .... ", end = '')
+# Save just the foundation model feature matrix
+np.save(f'/common/lamt2/HPV/data/foundation_models/{model}/20x_{tile_len}px_{overlap}px_overlap/h5ad_files/X_foundation_model_{slide}_weighted.npy', X_model)
+print(f'done: {(time.time() - t0)/60:.2f} min')
+print('---done---')
