@@ -24,9 +24,9 @@ These scripts were used for celltyping in the HPV project. They assume that you 
       * csv of the top 20 highly expressed genes by total counts  <-- This one is the most useful for Joe
       * Dotplot of the top 5 diffex genes expressed in >20% of cells
    * Joe occasionally asks for dotplots of specific genes, usually when classifying subclusters of already typed cells. A few example blocks are included for reference
-3) `plot_clusters.ipynb` - Notebook to plot specific clusters over the aligned h&e images
-   * Uses the alignment transformations to plot specific clusters from celltyping. We used this for epithelial but it can work for any anndata that has been leiden clustered.
-   * For each cluster, it plots the highest n cores by total cell count and highest proportion of cells from that cluster for the invasive and in-situ cores
+3) `plot_niches.ipynb` - Notebook to plot specific clusters over the aligned h&e images
+   * Uses the alignment transformations to plot cells on top of the h&e images
+   * Currently setup to plot the full channel h&e, celltypes, and niches
 
 
 ## General workflow
