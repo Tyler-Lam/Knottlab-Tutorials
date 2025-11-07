@@ -80,8 +80,8 @@ class GLMCollection():
         
         self.features_raw = features
         self.preselection = preselection
-        self.group_key = group_key
-        self.comparisons = comparisons
+        self.group_key = group_key if isinstance(group_key, list) else [group_key]
+        self.comparisons = comparisons if isinstance(group_key, list) else [comparisons]
 
         # Filter based on preselection and nan-values in predictors
         for col, val in self.preselection.items():
@@ -927,6 +927,7 @@ class GLMCollection():
         
         perm_df = self.run_permutations_parallel(contrasts, n_permutations=n_permutations, show_progress=show_progress, n_jobs = n_jobs, n_jobs_inner = n_jobs_inner)
 
+        warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
         # Function to calculate empirical p-values given a dataframe
         def calculate_empirical_fdr(df, perm_df, group_key, stat_col = 'stat'):
             
@@ -984,18 +985,17 @@ class GLMCollection():
         
         Returns dictionary of recommended n_jobs and n_jobs_inner values
         """
-        
-
-        print("Running test with inner parallelism")
+        print("Running test permutations to job allocation")
+        print("   Running test with inner parallelism")
         t0 = time.time()
-        test = self.run_permutations_parallel(n_permutations = 1, n_jobs = 1, n_jobs_inner = multiprocessing.cpu_count() - 1)
+        test = self.run_permutations_parallel(n_permutations = 1, n_jobs = 1, n_jobs_inner = multiprocessing.cpu_count() - 1, show_progress=False)
         t1 = time.time()
         
         t_inner_iter = t1 - t0
         
-        print("Running test with outer parallelism")
+        print("   Running test with outer parallelism")
         t0 = time.time()
-        test = self.run_permutations_parallel(n_permutations = multiprocessing.cpu_count() - 1, n_jobs = multiprocessing.cpu_count() - 1, n_jobs_inner = 1)
+        test = self.run_permutations_parallel(n_permutations = multiprocessing.cpu_count() - 1, n_jobs = multiprocessing.cpu_count() - 1, n_jobs_inner = 1, show_progress=False)
         t1 = time.time()
 
         t_outer_iter = t1 - t0
