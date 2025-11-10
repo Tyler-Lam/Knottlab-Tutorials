@@ -409,7 +409,7 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * kwargs: kwargs when calculating residuals. Generally "which" = ['counts', 'linear', 'rate', or 'pearson'] to specify the type of residual to calculate
+        * kwargs: kwargs when calculating residuals. Generally "which" = ['linear', 'rate', or 'pearson'] to specify the type of residual to calculate
         """
         out = np.array([])
         for model in self.models:
