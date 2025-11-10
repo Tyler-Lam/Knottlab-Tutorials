@@ -943,13 +943,15 @@ class GLMCollection():
 
             # Check to make sure perm_group has entries
             if len(perm_group) == 0:
-                df.loc[mask, 'p-nom'] = np.nan
-                df.loc[mask, 'p-adj'] = np.nan
-                df.loc[mask, 'fdr-q-val'] = np.nan
+                df.loc[mask, 'p-nom'] = np.nan      # Empirical p-value using null dist from specific feature
+                df.loc[mask, 'p-global'] = np.nan   # Empirical p-value using null dist from all features
+                df.loc[mask, 'fdr-q-val'] = np.nan  # p-global with FDR corrections
+                df.loc[mask, 'p-adj'] = np.nan      # fdr q-value with monotonicity corrections
                 return df
             
-            # Apply nominal p-value: fraction of null distribution greater or equal to T
-            df.loc[mask, 'p-nom'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1))
+            # Apply nominal p-value: fraction of null distribution greater or equal to T for the specific feature
+            df.loc[mask, 'p-global'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1))
+            df.loc[mask, 'p-nom'] = [np.sum(perm_df[perm_df.index == idx][stat_col] > val) / len(perm_df[perm_df.index == idx]) for idx, val in df.loc[mask, stat_col].items()]
             # Apply fdr correction: divide p-nom by fraction of real test stats greater or equal to T
             df.loc[mask, 'fdr-q-val'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1) / (np.mean(df.loc[mask, stat_col].values >= x)))
             # Calculate adjusted p-value as min(FDR(t)) for all t <= T. This keeps the p-value monotonic with test statistic
