@@ -215,7 +215,7 @@ class GLMCollection():
         # Get the model info for all columns to add
         all_metas = []
         for c in cols_to_add:
-            meta = self._parse_feature_name(c)
+            meta = self._parse_feature_name(c, skip = skip)
             if meta:
                 all_metas.append(meta)
         
