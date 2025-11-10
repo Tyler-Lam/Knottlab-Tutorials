@@ -6,8 +6,6 @@ class BetaGLMResults(BetaResults):
     """
     def __init__(self, model, mlefit):
         super(BetaGLMResults, self).__init__(model, mlefit)
-        #self.res = res
-        #self.params = self.res.params.values
         
     # Use the model's residual function
     def resid(self, which = 'rate'):
