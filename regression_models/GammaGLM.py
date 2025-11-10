@@ -2,7 +2,7 @@ from statsmodels_utils import *
 
 class GammaGLMResults(GLMResults):
     """
-    Wrapper class for Beta model results
+    Wrapper class for Gamma model results
     """
     def __init__(
         self, 
@@ -22,7 +22,7 @@ class GammaGLMResults(GLMResults):
             return self.resid_pearson
     
     def get_pdf(self, x, contrast):
-        beta = self.params.values
+        beta = self.params
         phi = self.model.scale
         mu = self.model.family.link.inverse((beta * contrast).sum())
         return stats.gamma.pdf(x, a = 1 / phi, scale = mu * phi)
