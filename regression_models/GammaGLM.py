@@ -32,9 +32,10 @@ class GammaGLM(sm.GLM):
     def __init__(self, 
                  endog,
                  exog, 
+                 link = sm.genmod.families.links.Log(),
                  **kwargs):
-        super(GammaGLM, self).__init__(endog, exog, family = sm.genmod.families.Gamma(link = sm.genmod.families.links.Log()), **kwargs)
-        
+        super(GammaGLM, self).__init__(endog, exog, family = sm.genmod.families.Gamma(link = link), **kwargs)
+        self.link = link
     def fit(self, *args, **kwargs):
         res = super().fit(*args, **kwargs)
         res._results.__class__ = GammaGLMResults
