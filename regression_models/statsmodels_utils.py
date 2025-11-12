@@ -259,7 +259,7 @@ def get_progression_df(stat_res, ref_group):
 def plot_progression_heatmap(
     stat_df, llr_df = None, index = ['Celltype', 'Region'], columns = 'Diagnosis', values = 'effect',
     ncols = 1, vmax = None, title = "", xlabel = None, cbar_label = 'log2FoldChange', row_cluster = True,
-    cbar_width = 0.03, cbar_height = 0.45, order = None, figsize = (10,10), show = True, save_dir = None):
+    pval_col = 'p-adj', cbar_width = 0.03, cbar_height = 0.45, order = None, figsize = (10,10), show = True, save_dir = None):
     """
     Make the heatmap for a feature across several values of a predictor. 
     Makes a pivot table and pass to seaborn clustermap and does additional formatting
@@ -278,6 +278,7 @@ def plot_progression_heatmap(
     * xlabel: Label for the x-axis (defaults to "columns" parameter)
     * cbar_label: Label for the colorbar
     * row_cluster: Cluster the rows and plot with a dendrogram. Otherwise order the rows based on the index
+    * pval_col: Column name for feature p-value labels on clustermap
     * cbar_width: width of colorbar
     * cbar_height: maximum height of colorbar
     * order: Left to right order for the columns
@@ -357,7 +358,7 @@ def plot_progression_heatmap(
         llr_df = llr_df.set_index(index)
         ordered_llr_df = llr_df.loc[row_order]
         #ordered_llr_df = pivot.merge(llr_df['p-adj'], on = index, how = 'left')
-        ylabels = ordered_llr_df['p-adj'].values
+        ylabels = ordered_llr_df[pval_col].values
         g.ax_heatmap.set_yticks([0.5 + x for x in range(len(pivot))])
         yticks = g.ax_heatmap.get_yticklabels()
         for label, tick in zip(ylabels, yticks):
