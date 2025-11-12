@@ -8,11 +8,11 @@ class BetaGLMResults(BetaResults):
         super(BetaGLMResults, self).__init__(model, mlefit)
         
     # Use the model's residual function
-    def resid(self, which = 'rate'):
-        if which == 'rate':
-            return super().resid
-        elif which == 'pearson':
-            return self.resid_pearson
+    #def resid(self, which = 'rate'):
+    #    if which == 'rate':
+    #        return super().resid
+    #    elif which == 'pearson':
+    #        return self.resid_pearson
     
     def get_pdf(self, x, contrast):
         params = self.params
@@ -32,6 +32,7 @@ class BetaGLM(BetaModel):
         res._results.__class__ = BetaGLMResults
         return res
     
+    """
     # Get expected output given an exog
     def predict(self, params, exog = None, which = 'counts'):
 
@@ -71,3 +72,4 @@ class BetaGLM(BetaModel):
             return self.link(endog) - y_pred
         else:
             raise ValueError("resid parameter 'which' must be 'rate', 'pearson', or 'linear'")
+    """

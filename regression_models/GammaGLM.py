@@ -15,11 +15,11 @@ class GammaGLMResults(GLMResults):
         super(GammaGLMResults, self).__init__(model, params, normalized_cov_params, scale, **kwargs)
         
     # Use the model's residual function
-    def resid(self, which = 'rate'):
-        if which == 'rate':
-            return self.resid_response
-        elif which == 'pearson':
-            return self.resid_pearson
+    #def resid(self, which = 'rate'):
+    #    if which == 'rate':
+    #        return self.resid_response
+    #    elif which == 'pearson':
+    #        return self.resid_pearson
     
     def get_pdf(self, x, contrast):
         beta = self.params
@@ -41,6 +41,7 @@ class GammaGLM(sm.GLM):
         res._results.__class__ = GammaGLMResults
         return res
     
+    """
     # Get expected output given an exog
     def predict(self, params, exog = None, which = 'mean', **kwargs):
 
@@ -75,3 +76,4 @@ class GammaGLM(sm.GLM):
             return self.family.link(endog) - y_pred
         else:
             raise ValueError("resid parameter 'which' must be 'mean', 'rate', 'pearson', or 'linear'")
+    """
