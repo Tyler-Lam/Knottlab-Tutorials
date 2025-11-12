@@ -2,6 +2,7 @@ from statsmodels_utils import *
 from BetaGLM import *
 from GammaGLM import *
 
+
 # Copied from Aagam's optimized code
 def _fit_single_model(model_name, model, fit_kwargs):
     """
@@ -249,7 +250,6 @@ class GLMCollection():
 
                 val_col = meta['val_col']
                 counts_col = meta['counts_col']
-                
                 # --- A. Construct feature-specific aggregated DataFrame ---
                 agg_df = pd.DataFrame(self.agg_features[counts_col]).rename(columns={counts_col: 'counts'})
 
@@ -323,8 +323,8 @@ class GLMCollection():
                     self.models_null[val_col] = GammaGLM(y, null_X)
                     
                 for warn in w:
-                    if 'category has group' in str(warn.message).lower():
-                        warning_list.append((val_col, warn.message))
+                    #if 'category has group' in str(warn.message).lower():
+                    warning_list.append((val_col, warn.message))
                         
         if verbose:
             for idx, warning in warning_list:
@@ -773,14 +773,45 @@ class GLMCollection():
                 continue
             lr_full = self.results[idx].llf
             lr_null = self.results_null[idx].llf
-            stat = 2 * (lr_full - lr_null)
+            stat = max(0, 2 * (lr_full - lr_null)) # Sometimes the LLR is negative due to numerical approximations
             stats.append(stat)
             indices.append(idx)
         out = pd.DataFrame({'stat': stats}, index = indices)
         out[['Celltype', 'Region', 'feature_type']] = out.index.to_series().apply(get_celltype_annot_region_feature_type).apply(pd.Series)
         return out
     
-    def _run_single_permutation(self, contrasts = None, n_jobs = None):
+    def _shuffle_agg_df(self, df, perm_cols = None, random_state = None):
+        """
+        Shuffle the aggregated feature dataframe and return the shuffled dataframe
+        
+        Parameters:
+        ------------
+        * perm_cols: Columns
+        """
+        warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
+
+        if perm_cols is None:
+            perm_cols = self.group_key + self.comparisons
+        elif not isinstance(perm_cols, list):
+            perm_cols = [perm_cols]
+        shuffled_df = df[perm_cols].drop_duplicates()
+        shuffled_df['tmp_idx'] = shuffled_df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
+        
+        # Make a shuffle dictionary to map
+        rng = np.random.default_rng(random_state)
+        shuffle_dict = dict(zip(shuffled_df['tmp_idx'], rng.permutation(shuffled_df['tmp_idx'])))
+        shuffled_df['tmp_idx'] = shuffled_df['tmp_idx'].map(shuffle_dict)
+        
+        # Re-merge the shuffled metadata and drop the temporary index
+        df['tmp_idx'] = df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
+        df = df.drop(columns = perm_cols)
+        
+        df = pd.merge(shuffled_df, df, on = 'tmp_idx', how = 'right')
+        df = df.drop(columns = ['tmp_idx'])
+        
+        return df
+        
+    def _run_single_permutation(self, contrasts = None, n_jobs = None, group_cols = None, perm_cols = None, random_state = None):
         """
         Run the statistical analysis on a single permutation. Shuffle the patients by group_key and get the stat dataframes for each comparison
         
@@ -791,26 +822,22 @@ class GLMCollection():
         
         with warnings.catch_warnings(record = True) as w:
             warnings.simplefilter("always")
+            if perm_cols is None:
+                perm_cols = self.group_key + self.comparisons
+            else:
+                if not isinstance(perm_cols, list):
+                    perm_cols = [perm_cols]
+                perm_cols = perm_cols + self.group_key
+
             # Permute the metadata by patient + comparison
             # We include the comparison because sometimes a single patient can be in different categories
             # across multiple samples
             # e.g. one patient can have an HPV+ and HPV- sample
             df = self.agg_features.copy().reset_index()
-            
-            # Make a temporary index for shuffling
-            shuffled_df = df[self.group_key + self.comparisons].drop_duplicates()
-            shuffled_df['tmp_idx'] = shuffled_df.apply(lambda x: '_'.join(str(x[c]) for c in self.group_key + self.comparisons), axis = 1)
-            
-            # Make a shuffle dictionary to map
-            shuffle_dict = dict(zip(shuffled_df['tmp_idx'], np.random.permutation(shuffled_df['tmp_idx'])))
-            shuffled_df['tmp_idx'] = shuffled_df['tmp_idx'].map(shuffle_dict)
-            
-            # Re-merge the shuffled metadata and drop the temporary index
-            df['tmp_idx'] = df.apply(lambda x: '_'.join(str(x[c]) for c in self.group_key + self.comparisons), axis = 1)
-            df = df.drop(columns = self.group_key + self.comparisons)
-            
-            df = pd.merge(df, shuffled_df, on = 'tmp_idx', how = 'left')
-            df = df.drop(columns = ['tmp_idx'])
+            if not group_cols:
+                df = self._shuffle_agg_df(df, random_state = random_state)
+            else:
+                df = df.groupby(group_cols, group_keys = False).apply(lambda g: self._shuffle_agg_df(g, perm_cols = perm_cols, random_state = random_state), include_groups = True)
             
             try:
                 # Make a new dataframe with the shuffled features, including the aggregated features to skip the groupby function
@@ -842,7 +869,7 @@ class GLMCollection():
                 print(f"   Permutation fitting failed: {e}")
                 return None
     
-    def run_permutations_parallel(self, contrasts = None, n_permutations = 1000, show_progress = True, n_jobs = None, n_jobs_inner = None):
+    def run_permutations_parallel(self, contrasts = None, n_permutations = 1000, show_progress = True, n_jobs = None, n_jobs_inner = None, random_state = None, **kwargs):
         """
         Run permutations in parallel
         
@@ -863,11 +890,16 @@ class GLMCollection():
                     n_jobs_inner = multiprocessing.cpu_count() - 1
                 results = []
                 for i in tqdm(range(n_permutations), desc = 'Running permutation tests', disable = not show_progress):
-                    results.append(self._run_single_permutation(contrasts = contrasts, n_jobs = n_jobs_inner))
+                    rs = random_state if random_state is None else random_state + i
+                    results.append(self._run_single_permutation(contrasts = contrasts, n_jobs = n_jobs_inner, random_state = rs, **kwargs))
             
             # If permutations are done in parallel, make each permutation take one job
             else:
-                tasks = [delayed(self._run_single_permutation)(contrasts = contrasts, n_jobs = 1) for _ in range(n_permutations)]
+                tasks = []
+                for i in range(n_permutations):
+                    rs = random_state if random_state is None else random_state + i
+                    tasks.append(delayed(self._run_single_permutation)(contrasts = contrasts, n_jobs = 1, random_state = rs, **kwargs))
+                #tasks = [delayed(self._run_single_permutation)(contrasts = contrasts, n_jobs = 1, **kwargs) for i in range(n_permutations)]
                 with tqdm_joblib(tqdm(desc = "Calculating permutations", total = len(tasks), disable = not show_progress)) as pbar:
                     results = Parallel(n_jobs = n_jobs)(tasks)
                         
@@ -887,7 +919,7 @@ class GLMCollection():
                 out[key] = pd.concat([out[key], tmp_df], axis = 0, join = 'outer')
         return out
     
-    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, fdr_group = None, ref_class = None, do_pairwise = True):
+    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, fdr_group = None, ref_class = None, do_pairwise = True, **kwargs):
         """
         Run the statistical test with permutations for empirical p-values and FDR q-values
         Empirical p-values are calculated as the fraction of null test statistics greater than the nominal wald test statistic. These are saved as p-wald-nom (or p-nom for the LLR test)
@@ -925,8 +957,7 @@ class GLMCollection():
             n_jobs_inner = (multiprocessing.cpu_count() - 1) // n_jobs
         n_jobs_inner = min((multiprocessing.cpu_count() - 1) // n_jobs, n_jobs_inner)
         
-        perm_df = self.run_permutations_parallel(contrasts, n_permutations=n_permutations, show_progress=show_progress, n_jobs = n_jobs, n_jobs_inner = n_jobs_inner)
-
+        perm_df = self.run_permutations_parallel(contrasts, n_permutations=n_permutations, show_progress=show_progress, n_jobs = n_jobs, n_jobs_inner = n_jobs_inner, **kwargs)
         warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
         # Function to calculate empirical p-values given a dataframe
         def calculate_empirical_fdr(df, perm_df, group_key, stat_col = 'stat'):
@@ -947,15 +978,17 @@ class GLMCollection():
                 df.loc[mask, 'p-global'] = np.nan   # Empirical p-value using null dist from all features
                 df.loc[mask, 'fdr-q-val'] = np.nan  # p-global with FDR corrections
                 df.loc[mask, 'p-adj'] = np.nan      # fdr q-value with monotonicity corrections
+                df.loc[mask, 'bh-p-val'] = np.nan # fwer p-value with BH correction
                 return df
             
             # Apply nominal p-value: fraction of null distribution greater or equal to T for the specific feature
             df.loc[mask, 'p-global'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1))
-            df.loc[mask, 'p-nom'] = [np.sum(perm_df[perm_df.index == idx][stat_col] > val) / len(perm_df[perm_df.index == idx]) for idx, val in df.loc[mask, stat_col].items()]
+            df.loc[mask, 'p-nom'] = [(np.sum(perm_df[perm_df.index == idx][stat_col] > val)+1) / (len(perm_df[perm_df.index == idx])+1) for idx, val in df.loc[mask, stat_col].items()]
             # Apply fdr correction: divide p-nom by fraction of real test stats greater or equal to T
             df.loc[mask, 'fdr-q-val'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1) / (np.mean(df.loc[mask, stat_col].values >= x)))
             # Calculate adjusted p-value as min(FDR(t)) for all t <= T. This keeps the p-value monotonic with test statistic
             df.loc[mask, 'p-adj'] = df.loc[mask].apply(lambda x: min(x['fdr-q-val'], np.min(df.loc[mask][df.loc[mask][stat_col] < x[stat_col]]['fdr-q-val'])), axis = 1)
+            df.loc[mask, 'bh-p-val'] = false_discovery_control(df.loc[mask, 'p-nom'], method = 'bh')
             return df
 
         # Use permutations as null distribution and apply to dataframe
