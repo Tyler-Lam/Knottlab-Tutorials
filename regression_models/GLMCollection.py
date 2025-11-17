@@ -97,6 +97,7 @@ class GLMCollection():
         # Use formulaic contrasts to get contrast vectors
         self.fc = FormulaicContrasts(self.features_raw, f'~ {self.formula}')
         self.null_formula = null_formula
+        self.fc_null = FormulaicContrasts(self.features_raw, '~ 1') if self.null_formula is None else FormulaicContrasts(self.features_raw, f'~ {self.null_formula}')
         
         self.features = {}
         self.models = {}
@@ -440,6 +441,27 @@ class GLMCollection():
         if model is not None and model in self.models:
             contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
         return contrast
+    
+    def cond_null(self, model = None, **kwargs):
+        """
+        Get the contrast vector using Formulaic Contrasts. To get difference between two classes, you subtract the contrast vectors and take the dot product with the fit coefficients
+        These are formatted as pandas series, where the row index is the design matrix col name and the value is 0 or 1
+        
+        Parameters:
+        ------------
+        kwargs: parameter = values must are predictors and categories to get the contrast for specific data classes
+        
+        Example: My design matrix used the formula "counts + total_counts ~ HR_HPV + P53 + HR_HPV:P53
+        To get the contrast comparing P53+ HPV- (test) with P53- HPV- (ref), I would do:
+        c_test = self.cond(P53 = 1, HR_HPV = 0)
+        c_ref = self.cond(P53 = 0, HR_HPV = 0)
+        c = c_test - c_ref
+        """
+        
+        contrast = self.fc_null.cond(**kwargs)
+        if model is not None and model in self.models_null:
+            contrast = contrast[self.models_null[model].exog_names[:self.models_null[model].exog.shape[1]]]
+        return contrast
 
     def plot_model(self, model, fitted = False, order = None, logy = False, cbar_label = '', ax_label = '', figsize = (8, 10), show = True, save_dir = None):
         """
@@ -481,21 +503,6 @@ class GLMCollection():
         # Get the linspace for the x-axis
         x = np.linspace(min(self.features[model]['rate']), max(self.features[model]['rate']), 1000)
 
-        # If using the fitted model, get the pdf for each classification
-        if fitted:
-            pdfs = {}
-            pdf_max = 0 # Max value of pdf for shared normalization
-            for i, cat in enumerate(x_pos.keys()):
-                
-                # Get col: val pairs from the classification names
-                vals ={x.split('__')[0]: self.features[model][x.split('__')[0]].dtype.type(x.split('__')[1]) for x in cat.split('___')}
-                # Use col: val pairs to get the given contrast
-                contrast = self.cond(**vals)
-                # Sometimes the contrast orders don't match. Fix that here:
-                contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
-                result = self.results[model]
-                pdfs[cat] = result.get_pdf(x, contrast)
-                pdf_max = max(pdf_max, pdfs[cat][np.isfinite(pdfs[cat])].max())
 
         # Make the histogram
         sns.histplot(
@@ -510,17 +517,33 @@ class GLMCollection():
             ax = ax[0],
         )
         
-        # If fitted, overlay the pdfs
+        ymin, ymax = ax[0].get_ylim()
+
+        # If using the fitted model, get the pdf for each classification
         if fitted:
-            for cat in pdfs:
+            pdfs = {}
+            pdf_max = 1.2 * ymax # Max value of pdf for shared normalization
+            for i, cat in enumerate(x_pos.keys()):
+                
+                # Get col: val pairs from the classification names
+                vals ={x.split('__')[0]: self.features[model][x.split('__')[0]].dtype.type(x.split('__')[1]) for x in cat.split('___')}
+                # Use col: val pairs to get the given contrast
+                contrast = self.cond(**vals)
+                # Sometimes the contrast orders don't match. Fix that here:
+                contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
+                result = self.results[model]
+                pdfs[cat] = result.get_pdf(x, contrast)
+                pdf_max = max(pdf_max, pdfs[cat][np.isfinite(pdfs[cat])].max())
+
                 ax[0].plot(x, pdfs[cat], '-')
                 
+            ax[0].set_ylim(None, pdf_max)
         # Histogram plot formatting
         ax[0].set_ylabel("a.u.")
         ax[0].set_xlabel(ax_label)
         if logy:
             ax[0].set_yscale('log')
-        
+
         denom = 'total_counts' if isinstance(self.models[model], BetaGLM) else 'scale'
         
         # If not using fitted model, use a violin plot
@@ -563,8 +586,8 @@ class GLMCollection():
             for i, cat in enumerate(x_pos.keys()):
                 ax[1].fill_betweenx(
                     x, 
-                    x_pos[cat] - 0.45 * pdfs[cat]/pdf_max, 
-                    x_pos[cat] + 0.45 * pdfs[cat]/pdf_max, 
+                    x_pos[cat] - 0.45 * np.clip(pdfs[cat], a_min = None, a_max = ymax)/pdf_max, 
+                    x_pos[cat] + 0.45 * np.clip(pdfs[cat], a_min = None, a_max = ymax)/pdf_max, 
                     alpha = 0.3, 
                     color = f'C{i}'
                 )
@@ -621,11 +644,17 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * contrasts (List[dict]): List of contrast info. {'test': test_contrast, 'ref': ref_contrast, 'name': name}
+        * contrasts (List[dict]): List of contrast info. {'test': test_contrast, 'ref': ref_contrast, 'name': name}. Contrasts must be either pd.Series or dictionaries defining the classes
         """     
         out = {}
         for c in tqdm(contrasts, desc = 'Getting stat dataframes', disable = not show_progress):
-            out[c['name']] = self.get_stat_df_parallel(c['test'], c['ref'], c['name'], n_jobs = n_jobs)   
+            c_ref = c['ref']
+            c_test = c['test']
+            if isinstance(c['ref'], dict):
+                c_ref = self.cond(**c_ref)
+            if isinstance(c['test'], dict):
+                c_test = self.cond(**c_test)
+            out[c['name']] = self.get_stat_df_parallel(c['test'], c_ref, c_test, n_jobs = n_jobs)   
         return out
 
     def run_stats_pairwise(self, **kwargs):
@@ -919,7 +948,7 @@ class GLMCollection():
                 out[key] = pd.concat([out[key], tmp_df], axis = 0, join = 'outer')
         return out
     
-    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, fdr_group = None, ref_class = None, do_pairwise = True, **kwargs):
+    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, fdr_group = None, ref_class = None, do_pairwise = True, contrasts = None, **kwargs):
         """
         Run the statistical test with permutations for empirical p-values and FDR q-values
         Empirical p-values are calculated as the fraction of null test statistics greater than the nominal wald test statistic. These are saved as p-wald-nom (or p-nom for the LLR test)
@@ -938,16 +967,19 @@ class GLMCollection():
 
         if fdr_group is not None and not isinstance(fdr_group, list):
             fdr_group = [fdr_group]
-            
-        contrasts = []
+        
         stat_res = {}
-        if do_pairwise:
-            # Get initial stat results
-            stat_res = self.run_stats(ref_class = ref_class)
-            
-            # Get all contrasts from the original stat results
-            for key in stat_res:
-                contrasts.append(dict(name = key, test = stat_res[key]['c_test'], ref = stat_res[key]['c_ref']))
+        if contrasts is None:
+            contrasts = []
+            if do_pairwise:
+                # Get initial stat results
+                stat_res = self.run_stats(ref_class = ref_class)
+                
+                # Get all contrasts from the original stat results
+                for key in stat_res:
+                    contrasts.append(dict(name = key, test = stat_res[key]['c_test'], ref = stat_res[key]['c_ref']))
+        else:
+            stat_res = self.run_stats(contrasts=contrasts)
             
         # Run permutations
         if n_jobs is None:
