@@ -610,12 +610,17 @@ class GLMCollection():
         * c_test, c_ref (pd.Series): contrast vectors for test and ref classes, given from self.cond()
         * name: Name of the current comparison
         """
+        
+        if isinstance(c_test, dict):
+            c_test = self.cond(**c_test)
+        if isinstance(c_ref, dict):
+            c_ref = self.cond(**c_ref)
+            
         if n_jobs is None:
             n_jobs = multiprocessing.cpu_count() - 1
             
         if n_jobs == 1:
             results = [_run_single_comparison(res, c_test, c_ref, name) for name, res in self.results.items()]
-
         else:
             tasks = [delayed(_run_single_comparison)(res, c_test, c_ref, name) for name, res in self.results.items()]
             results = Parallel(n_jobs = n_jobs)(tasks)
@@ -648,13 +653,7 @@ class GLMCollection():
         """     
         out = {}
         for c in tqdm(contrasts, desc = 'Getting stat dataframes', disable = not show_progress):
-            c_ref = c['ref']
-            c_test = c['test']
-            if isinstance(c['ref'], dict):
-                c_ref = self.cond(**c_ref)
-            if isinstance(c['test'], dict):
-                c_test = self.cond(**c_test)
-            out[c['name']] = self.get_stat_df_parallel(c['test'], c_ref, c_test, n_jobs = n_jobs)   
+            out[c['name']] = self.get_stat_df_parallel(c['test'], c['ref'], c['test'], n_jobs = n_jobs)   
         return out
 
     def run_stats_pairwise(self, **kwargs):
