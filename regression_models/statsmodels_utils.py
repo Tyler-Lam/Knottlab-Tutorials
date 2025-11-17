@@ -13,7 +13,7 @@ from patsy import dmatrices
 import statsmodels.api as sm
 from formulaic_contrasts import FormulaicContrasts
 from joblib import Parallel, delayed, parallel_backend
-from itertools import combinations
+from itertools import combinations, product
 import warnings
 from collections import defaultdict
 from pathlib import Path
