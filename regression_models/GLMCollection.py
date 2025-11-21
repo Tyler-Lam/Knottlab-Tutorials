@@ -498,11 +498,15 @@ class GLMCollection():
                 x_pos = {cat: i for i, cat in enumerate(order)}
                 
         # Get uniform binning for all histograms
-        bins = np.histogram_bin_edges(self.features[model]['rate'])
-        
+        bins = np.histogram_bin_edges(self.features[model]['rate'], bins = 'auto')
+        if logy:
+            bins = np.logspace(np.log10(bins[0] if bins[0] > 0 else self.features[model]['rate'].min()), np.log10(bins[-1]), 10)
         # Get the linspace for the x-axis
-        x = np.linspace(min(self.features[model]['rate']), max(self.features[model]['rate']), 1000)
+        #x = np.linspace(min(self.features[model]['rate']), max(self.features[model]['rate']), 1000)
+        x = np.linspace(bins[0], bins[-1], 1000)
 
+        if logy:
+            x = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 1000)
 
         # Make the histogram
         sns.histplot(
@@ -516,15 +520,16 @@ class GLMCollection():
             common_norm = False, 
             ax = ax[0],
         )
-        
+        if logy:
+            ax[0].set_xscale('log')
+            
         ymin, ymax = ax[0].get_ylim()
 
         # If using the fitted model, get the pdf for each classification
         if fitted:
             pdfs = {}
-            pdf_max = 1.2 * ymax # Max value of pdf for shared normalization
+            pdf_max = 0 # Max value of pdf for shared normalization
             for i, cat in enumerate(x_pos.keys()):
-                
                 # Get col: val pairs from the classification names
                 vals ={x.split('__')[0]: self.features[model][x.split('__')[0]].dtype.type(x.split('__')[1]) for x in cat.split('___')}
                 # Use col: val pairs to get the given contrast
@@ -537,12 +542,10 @@ class GLMCollection():
 
                 ax[0].plot(x, pdfs[cat], '-')
                 
-            ax[0].set_ylim(None, pdf_max)
+            ax[0].set_ylim(None, ymax if (ymax < pdf_max) else 1.2*ymax)
         # Histogram plot formatting
         ax[0].set_ylabel("a.u.")
         ax[0].set_xlabel(ax_label)
-        if logy:
-            ax[0].set_yscale('log')
 
         denom = 'total_counts' if isinstance(self.models[model], BetaGLM) else 'scale'
         
@@ -591,9 +594,13 @@ class GLMCollection():
                     alpha = 0.3, 
                     color = f'C{i}'
                 )
+                
+        if logy:
+            ax[1].set_yscale('log')
         ax[1].set_ylabel(ax_label)
         fig.suptitle(model)
-        
+        ax[0].grid()
+        ax[1].grid()
         if save_dir is not None:
             plt.savefig(f'{save_dir}/fitted_{model}.png', bbox_inches = 'tight')
         if show:
@@ -601,6 +608,131 @@ class GLMCollection():
         else:
             plt.close()
 
+    def plot_model_no_hist(self, model, fitted = False, order = None, logy = False, cbar_label = '', ax_label = '', figsize = (8, 10), show = True, ax = None, save_dir = None, title = ''):
+        """
+        Plot the distribution of data for a given model. Top plot is a normalized histogram for each feature category (unstacked). Bottom plot is a strip + violin plot with points colored by the denominator (total_counts or scale)
+        
+        Parameters:
+        ------------
+        * model (str): Model name to plot
+        * fitted: Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
+        * order: Order (and subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
+                If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
+        * logy: Use a log scale for the y-axis
+        * cbar_label: Label for the colorbar. This always uses the denominator when calculating the feature, so for proportions the label should be "Total cells", densities should be "Area", etc.
+        * ax_label: Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
+        """
+        
+        return_fig = True
+        # Check that model exists and is converged if using fitted
+        if fitted:
+            if model not in self.results.keys() or not self.converged[model]:
+                print (f'Model {model} does not have a fitted model')
+                fitted = False
+
+        # Make the subplots
+        if ax is None:
+            fig, ax = plt.subplots(figsize = figsize, constrained_layout = True)
+            return_fig = False
+        
+        # Get the x-position for each classifications
+        x_pos = {cat:i for i, cat in enumerate(self.features[model]['classification'].unique())}
+        
+        # If given a fixed order, make sure that classifications are present in the model
+        if order is not None:
+            if not set(order).issubset(set(self.features[model]['classification'].unique())):
+                print(f"Given order has values not contained in the model's classification categories.\nPossible values are: {', '.join(self.features[model]['classification'].unique())}")
+            else:
+                x_pos = {cat: i for i, cat in enumerate(order)}
+                
+        # Get uniform binning for all histograms
+        content, bins = np.histogram(self.features[model]['rate'], bins = 'auto')
+        if logy:
+            bins = np.logspace(np.log10(bins[0] if bins[0] > 0 else self.features[model]['rate'].min()), np.log10(bins[-1]), 10)
+        # Get the linspace for the x-axis
+        #x = np.linspace(min(self.features[model]['rate']), max(self.features[model]['rate']), 1000)
+        x = np.linspace(bins[0], bins[-1], 1000)
+        if logy:
+            x = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 1000)
+            
+        ymax = 1.15 * content.max()
+
+        # If using the fitted model, get the pdf for each classification
+        if fitted:
+            pdfs = {}
+            pdf_max = 0 # Max value of pdf for shared normalization
+            for i, cat in enumerate(x_pos.keys()):
+                # Get col: val pairs from the classification names
+                vals ={x.split('__')[0]: self.features[model][x.split('__')[0]].dtype.type(x.split('__')[1]) for x in cat.split('___')}
+                # Use col: val pairs to get the given contrast
+                contrast = self.cond(**vals)
+                # Sometimes the contrast orders don't match. Fix that here:
+                contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
+                result = self.results[model]
+                pdfs[cat] = result.get_pdf(x, contrast)
+                pdf_max = max(pdf_max, pdfs[cat][np.isfinite(pdfs[cat])].max())
+
+        denom = 'total_counts' if isinstance(self.models[model], BetaGLM) else 'scale'
+        
+        # If not using fitted model, use a violin plot
+        if not fitted:
+            sns.violinplot(
+                x = 'classification',
+                y = 'rate',
+                data = self.features[model],
+                ax = ax,
+                order = order,
+                alpha = 0.5,
+                legend = False,
+                inner = None,
+            )
+            
+        # Stripplot the data over the violin plot
+        sns.stripplot(
+            x = 'classification', 
+            y = 'rate', 
+            hue = denom, 
+            data = self.features[model], 
+            ax = ax,
+            order = order,
+            linewidth = 0.5,
+            palette = 'flare',
+            legend = False,
+            size = 2.75)
+        
+        # Axis tick and colorbar formatting
+        ax.tick_params(axis = 'x', labelrotation = 45)
+        norm = plt.Normalize(self.features[model][denom].min(), self.features[model][denom].max())
+        scalar = plt.cm.ScalarMappable(cmap = 'flare', norm = norm)
+        scalar.set_array([])
+        cbar = ax.figure.colorbar(scalar, ax = ax, pad = 0.02)
+        cbar.set_label(cbar_label)
+        
+        # Use the (shared)-normalized pdfs as the envelope if using a fitted model
+        if fitted:
+            for i, cat in enumerate(x_pos.keys()):
+                ax.fill_betweenx(
+                    x, 
+                    x_pos[cat] - 0.45 * np.clip(pdfs[cat], a_min = None, a_max = ymax)/pdf_max, 
+                    x_pos[cat] + 0.45 * np.clip(pdfs[cat], a_min = None, a_max = ymax)/pdf_max, 
+                    alpha = 0.3, 
+                    color = f'C{i}'
+                )
+                
+        if logy:
+            ax.set_yscale('log')
+        ax.set_ylabel(ax_label)
+        ax.set_title(title)
+        ax.grid()
+        if save_dir is not None:
+            plt.savefig(f'{save_dir}/fitted_{model}.png', bbox_inches = 'tight')
+        if return_fig:
+            return ax
+        if show:
+            plt.show()
+        else:
+            plt.close()
+            
     def get_stat_df_parallel(self, c_test, c_ref, name, n_jobs = None):
         """
         Get the stat dataframe for all models
@@ -651,9 +783,13 @@ class GLMCollection():
         -----------
         * contrasts (List[dict]): List of contrast info. {'test': test_contrast, 'ref': ref_contrast, 'name': name}. Contrasts must be either pd.Series or dictionaries defining the classes
         """     
-        out = {}
+        out = defaultdict(dict)
         for c in tqdm(contrasts, desc = 'Getting stat dataframes', disable = not show_progress):
             out[c['name']] = self.get_stat_df_parallel(c['test'], c['ref'], c['test'], n_jobs = n_jobs)   
+            if isinstance(c['ref'], dict):
+                out[c['name']]['ref_group'] = c['ref']
+            if isinstance(c['test'], dict):
+                out[c['name']]['test_group'] = c['test']
         return out
 
     def run_stats_pairwise(self, **kwargs):
@@ -947,26 +1083,22 @@ class GLMCollection():
                 out[key] = pd.concat([out[key], tmp_df], axis = 0, join = 'outer')
         return out
     
-    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, fdr_group = None, ref_class = None, do_pairwise = True, contrasts = None, **kwargs):
+    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, ref_class = None, contrasts = None, do_pairwise = True, **kwargs):
         """
-        Run the statistical test with permutations for empirical p-values and FDR q-values
+        Run the statistical test with permutations for empirical p-values
         Empirical p-values are calculated as the fraction of null test statistics greater than the nominal wald test statistic. These are saved as p-wald-nom (or p-nom for the LLR test)
-        FDR q-values are the empirical p-values divided by the fraction of real features with a greater or equal wald test statistic. These are saved as p-wald-adj (or p-adj for the LLR test)
         
-        This is analogous to the Storey-Tribshirani multiple-trials correction, and what GSEA uses for phenotype permutation tests
+        (UPDATE: We no longer do this part) This is analogous to the Storey-Tribshirani multiple-trials correction, and what GSEA uses for phenotype permutation tests
         https://pubmed.ncbi.nlm.nih.gov/12883005/
         
         Parameters:
         ------------
         * n_permutations, n_jobs, verbose are the same as the run_permutations() function
-        * fdr_group (str): Column for grouping permutation tests. If None, calculate empirical p-values and FDR correction across all features. Otherwise group features by the fdr_group column and
-                           calculate the permutation testing p-values within each group
+        * contrasts (List[dict] / dict): Contrast metadata dictionary defining the groups for pairwise comparisons
+        * do_pairwise: If contrasts is None, do pairwise comparisons.
         * ref_class (dict): Dictionary specifying the reference class predictors. If none, do all pairwise comparisons
         """
 
-        if fdr_group is not None and not isinstance(fdr_group, list):
-            fdr_group = [fdr_group]
-        
         stat_res = {}
         if contrasts is None:
             contrasts = []
@@ -978,6 +1110,8 @@ class GLMCollection():
                 for key in stat_res:
                     contrasts.append(dict(name = key, test = stat_res[key]['c_test'], ref = stat_res[key]['c_ref']))
         else:
+            if not isinstance(contrasts, list):
+                contrasts = [contrasts]
             stat_res = self.run_stats(contrasts=contrasts)
             
         # Run permutations
@@ -991,55 +1125,34 @@ class GLMCollection():
         perm_df = self.run_permutations_parallel(contrasts, n_permutations=n_permutations, show_progress=show_progress, n_jobs = n_jobs, n_jobs_inner = n_jobs_inner, **kwargs)
         warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
         # Function to calculate empirical p-values given a dataframe
-        def calculate_empirical_fdr(df, perm_df, group_key, stat_col = 'stat'):
+        def calculate_empirical_fdr(df, perm_df, stat_col = 'stat'):
             
             # mask out nan values in the stat df and perm df
             mask = ~df[stat_col].isna()
             perm_mask = ~perm_df[stat_col].isna()
             
-            # If using group_key, filter perm_df to match feature group
-            if group_key is not None:
-                for key in group_key:
-                    perm_mask &= (perm_df[key].values == df[key].iloc[0])
             perm_group = perm_df.loc[perm_mask]
 
             # Check to make sure perm_group has entries
             if len(perm_group) == 0:
                 df.loc[mask, 'p-nom'] = np.nan      # Empirical p-value using null dist from specific feature
-                df.loc[mask, 'p-global'] = np.nan   # Empirical p-value using null dist from all features
-                df.loc[mask, 'fdr-q-val'] = np.nan  # p-global with FDR corrections
-                df.loc[mask, 'p-adj'] = np.nan      # fdr q-value with monotonicity corrections
-                df.loc[mask, 'bh-p-val'] = np.nan # fwer p-value with BH correction
                 return df
             
             # Apply nominal p-value: fraction of null distribution greater or equal to T for the specific feature
-            df.loc[mask, 'p-global'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1))
             df.loc[mask, 'p-nom'] = [(np.sum(perm_df[perm_df.index == idx][stat_col] > val)+1) / (len(perm_df[perm_df.index == idx])+1) for idx, val in df.loc[mask, stat_col].items()]
-            # Apply fdr correction: divide p-nom by fraction of real test stats greater or equal to T
-            df.loc[mask, 'fdr-q-val'] = df.loc[mask, stat_col].apply(lambda x: (np.sum(perm_group[stat_col].values >= x) + 1) / (len(perm_group[stat_col]) + 1) / (np.mean(df.loc[mask, stat_col].values >= x)))
-            # Calculate adjusted p-value as min(FDR(t)) for all t <= T. This keeps the p-value monotonic with test statistic
-            df.loc[mask, 'p-adj'] = df.loc[mask].apply(lambda x: min(x['fdr-q-val'], np.min(df.loc[mask][df.loc[mask][stat_col] < x[stat_col]]['fdr-q-val'])), axis = 1)
-            df.loc[mask, 'bh-p-val'] = false_discovery_control(df.loc[mask, 'p-nom'], method = 'bh')
             return df
 
         # Use permutations as null distribution and apply to dataframe
         for key in stat_res:
             stat_df = stat_res[key]['df']
             
-            if fdr_group is None or not set(fdr_group).issubset(stat_df.columns):
-                stat_df = calculate_empirical_fdr(stat_df.copy(), perm_df[key], None, stat_col = 't-wald')
-            else:
-                stat_df = stat_df.groupby(fdr_group, group_keys = False).apply(lambda g: calculate_empirical_fdr(g, perm_df[key], fdr_group, stat_col = 't-wald'), include_groups = True)
-
+            stat_df = calculate_empirical_fdr(stat_df.copy(), perm_df[key], stat_col = 't-wald')
             stat_res[key]['df'] = stat_df
             stat_res[key]['perm_df'] = perm_df[key]
         
         # Calculate permutations from the LLR test for feature-wide significance
         llr_df = self.run_LLR_test()
-        if fdr_group is None or not set(fdr_group).issubset(llr_df.columns):
-            llr_df = calculate_empirical_fdr(llr_df.copy(), perm_df['llr'], None, stat_col = 'stat')
-        else:
-            llr_df = llr_df.groupby(fdr_group, group_keys = False).apply(lambda g: calculate_empirical_fdr(g, perm_df['llr'], fdr_group, stat_col = 'stat'), include_groups = True)
+        llr_df = calculate_empirical_fdr(llr_df.copy(), perm_df['llr'], stat_col = 'stat')
         stat_res['llr'] = {'df': llr_df, 'perm_df': perm_df['llr']}
         return stat_res
 
@@ -1052,25 +1165,26 @@ class GLMCollection():
         Returns dictionary of recommended n_jobs and n_jobs_inner values
         """
         print("Running test permutations to job allocation")
-        print("   Running test with inner parallelism")
+        print("   Running test with inner parallelism", end = ' ... ')
         t0 = time.time()
         test = self.run_permutations_parallel(n_permutations = 1, n_jobs = 1, n_jobs_inner = multiprocessing.cpu_count() - 1, show_progress=False)
         t1 = time.time()
         
         t_inner_iter = t1 - t0
-        
-        print("   Running test with outer parallelism")
+        print(f"done: {t_inner_iter:.2f} s")
+        print("   Running test with outer parallelism", end = " ... ")
         t0 = time.time()
         test = self.run_permutations_parallel(n_permutations = multiprocessing.cpu_count() - 1, n_jobs = multiprocessing.cpu_count() - 1, n_jobs_inner = 1, show_progress=False)
         t1 = time.time()
 
         t_outer_iter = t1 - t0
+        print(f"done: {t_outer_iter:.2f} s")
         
         t_inner_total = t_inner_iter * n_perm
         
         t_outer_total = math.ceil(n_perm / (multiprocessing.cpu_count() - 1)) * t_outer_iter
         
-        print(f'\nEstimated time with inner parallelism: {t_inner_total/60:.2f} min')
+        print(f'Estimated time with inner parallelism: {t_inner_total/60:.2f} min')
         print(f'Estimated time with outer parallelism: {t_outer_total/60:.2f} min')
         
         if t_inner_total < t_outer_total:
