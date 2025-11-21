@@ -9,6 +9,9 @@ from tqdm import tqdm
 from scipy import stats
 from scipy.stats import beta, mannwhitneyu
 from scipy.stats import false_discovery_control
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.metrics import silhouette_score
 from patsy import dmatrices
 import statsmodels.api as sm
 from formulaic_contrasts import FormulaicContrasts
@@ -31,6 +34,8 @@ from scipy.special import gammaln
 from scipy.stats import lognorm
 from scipy.optimize import minimize_scalar
 from scipy.stats import nbinom
+
+from statannotations.Annotator import Annotator
 
             
 # Stackoverflow solution to make tqdm work with joblib.Parallel
@@ -240,7 +245,6 @@ def get_progression_df(stat_res, ref_group):
         if res['ref_group'] == ref_group:
             for col, val in res['test_group'].items():
                 tmp_df[col] = val
-        
         elif res['test_group'] == ref_group:
             for col, val in res['ref_group'].items():
                 tmp_df[col] = val
@@ -257,9 +261,9 @@ def get_progression_df(stat_res, ref_group):
     return res_df
 
 def plot_progression_heatmap(
-    stat_df, llr_df = None, index = ['Celltype', 'Region'], columns = 'Diagnosis', values = 'effect',
+    stat_df, llr_df = None, index = ['Celltype', 'Region'], columns = 'Diagnosis', values = 'effect', signif_col = None,
     ncols = 1, vmax = None, title = "", xlabel = None, cbar_label = 'log2FoldChange', row_cluster = True,
-    pval_col = 'p-adj', cbar_width = 0.03, cbar_height = 0.45, order = None, figsize = (10,10), show = True, save_dir = None):
+    pval_col = 'p-nom', cbar_width = 0.03, cbar_height = 0.45, order = None, figsize = (10,10), show = True, save_dir = None):
     """
     Make the heatmap for a feature across several values of a predictor. 
     Makes a pivot table and pass to seaborn clustermap and does additional formatting
@@ -272,6 +276,7 @@ def plot_progression_heatmap(
     * index: Columns used to index the pivot table
     * columns: Col name to use a columns for the pivot table
     * values: Values for the pivot table
+    * signif (pd.Series): Column in llr_df to indicate significance. If none, use llr_df[pval_col] <= 0.05
     * ncols: Number of columns to use for celltype legend. Values >1 only really works for niches
     * vmax: Maximum value for heatmap normalization
     * title: Title for the plot
@@ -361,9 +366,13 @@ def plot_progression_heatmap(
         ylabels = ordered_llr_df[pval_col].values
         g.ax_heatmap.set_yticks([0.5 + x for x in range(len(pivot))])
         yticks = g.ax_heatmap.get_yticklabels()
-        for label, tick in zip(ylabels, yticks):
-            tick.set_text(f'p={label:.3f}')
-            if label < 0.05:
+        if signif_col is None:
+            signif = llr_df.loc[row_order, pval_col] <= 0.05
+        else:
+            signif = llr_df.loc[row_order, signif_col]
+        for label, tick, sig in zip(ylabels, yticks, signif):
+            tick.set_text(f'p={label:.3f}')                
+            if sig:
                 tick.set_fontweight('bold')
         g.ax_heatmap.set_yticklabels(yticks)
             
@@ -430,3 +439,194 @@ def plot_progression_heatmap(
         return g
     else:
         plt.close()
+
+# Fast correlation calculations to handle NaN values in permutation test statistics
+from numba import njit, prange
+@njit(parallel = True)
+def fast_corr(X):
+    n, m = X.shape
+    res = np.empty((m, m), dtype = np.float32)
+    
+    for i in prange(m):
+        res[i, i] = 1.0
+        for j in range(i+1, m):
+            
+            # Calculate means of each column (omitting nans)
+            count = 0
+            xi = 0.0
+            xj = 0.0
+            for k in range(n):
+                if not np.isnan(X[k, i]) and not np.isnan(X[k,j]):
+                    xi += X[k,i]
+                    xj += X[k,j]
+                    count += 1
+            if count < 2:
+                res[i, j] = np.nan
+                res[j, i] = np.nan
+            mean_i = xi / count
+            mean_j = xj / count
+
+            # Calculate variance and covariance
+            cov = 0.0
+            var_i = 0.0
+            var_j = 0.0
+            
+            for k in range(n):
+                if not np.isnan(X[k,i]) and not np.isnan(X[k,j]):
+                    di = X[k,i] - mean_i
+                    dj = X[k,j] - mean_j
+                    cov += di * dj
+                    var_i += di*di
+                    var_j += dj*dj
+            if var_i == 0 or var_j == 0:
+                corr = np.nan
+            else:
+                corr = cov / np.sqrt(var_i * var_j)
+            res[i,j] = corr
+            res[j,i] = corr
+    return res
+
+# Calculate the simes p-value given a pandas series of p-values
+def get_simes_p(pvals):
+    sorted_pvals = pvals.sort_values(ascending = True)
+    m = len(sorted_pvals)
+    simes_vals = sorted_pvals * m / np.arange(1, m+1)
+    return simes_vals.min()
+
+# Used for applying fdr control to groups of a dataframe
+def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
+    df[out_col] = false_discovery_control(df[pval_col])
+    return df
+
+# Run Benjamini Bogomolov selection by clustering based on permutations
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05):
+    
+    t_start = time.time()
+    print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
+    # Filter the permutation df to only use features in the llr df
+    sub_perm_df = perm_df[perm_df['index'].isin(llr_df.index)]
+    
+    print("   Calculating correlation distance matrix", end = ' ... ')
+    t0 = time.time()
+    # Make the pivot table and rank dataframe
+    pivot = sub_perm_df.pivot(index = 'perm_iter', columns = 'index', values = 'stat')
+    ranks = pivot.rank(axis = 0)
+    
+    # Make the correlation matrix and dataframe
+    corr = fast_corr(ranks.to_numpy())
+    corr_df = pd.DataFrame(corr, columns = ranks.columns, index = ranks.columns)
+    
+    # Make distance matrix and calculate linkage
+    dist = 1 - corr
+    dist_condensed = squareform(dist)
+    print(f"done: {(time.time() - t0) / 60:.2f} min")
+    Z = linkage(dist_condensed, method = 'average') # Unsure if 'average' is proper for this but idk
+    
+    # Calculate best threshold for clustering:
+    best_labels = []
+    best_score = 0
+    best_t = 0
+    for t in tqdm(np.linspace(0, 1, 200), desc = "Calculating best clustering threshold"):
+
+        labels = fcluster(Z, t = t, criterion='distance')
+        n_clusters = len(np.unique(labels))
+        if n_clusters > 1 and n_clusters < len(corr):
+            score = silhouette_score(dist, labels = labels, metric = 'precomputed')
+            if score > best_score:
+                best_t = t
+                best_score = score
+                best_labels = labels
+
+    print(f"   Clustering at threshold t = {best_t:.3f}")
+    
+    # Add labels to correlation dataframe
+    corr_df['cluster'] = best_labels
+    # Add labels to the LLR df
+    clusters_df = pd.merge(llr_df, corr_df['cluster'], left_index = True, right_index = True, how = 'left')
+    # Calculate simes p-value for each group
+    simes_df = clusters_df.groupby('cluster')['p-nom'].apply(get_simes_p)
+    simes_df = simes_df.rename('p-simes')
+    # Add the simes df for future use
+    clusters_df = pd.merge(clusters_df, simes_df, left_on = 'cluster', right_index = True, how = 'left')
+    # Apply BH correction within each cluster
+    clusters_df = clusters_df.groupby('cluster').apply(lambda g: apply_fdr(g))
+    clusters_df.index = clusters_df.index.get_level_values(1)
+    
+    R = len(simes_df[simes_df <= alpha])
+    m = len(simes_df)
+    
+    signif = (clusters_df['p-simes'] <= alpha) & (clusters_df['cluster-p-adj'] <= alpha * R / m)
+    
+    clusters_df['signif'] = signif
+    clusters_df['fdr-q-val'] = clusters_df['cluster-p-adj'].apply(lambda x: min(x * m / R, 1) if R > 0 else 1)
+    print(f"Done with FDR corrections: {(time.time() - t_start) / 60:.2f} min")
+    return clusters_df
+
+
+
+def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax = None, title = ""):
+    """
+    Plot the posthoc comparisons using means of the fits and pairwise comparisons
+    
+    Parameters:
+    * glms (GLMCollection): fitted GLMCollection for all models
+    * pvals (pd.DataFrame): posthoc dataframe (formatted as shown in tutorial notebook)
+    * feature (str): Feature name for comparison
+    * order: Order for x-axis categories
+    * ylabel: Y axis label
+    * title: axis label
+    """
+    
+    pvals_df = pvals[pvals['feature'] == feature].copy()
+    #pvals_df = pvals_df.sort_values('fdr-q-val')
+    pairs = [[g1, g2] for g1, g2 in zip(pvals_df['group1'].values, pvals_df['group2'].values)]
+    ps = pvals_df['fdr-q-val'].values
+
+    means = []
+    err_low = []
+    err_high = []
+    tmp = pd.DataFrame()
+    for cat in order:
+        c = glms.cond(**{cat.split('__')[0]: cat.split('__')[1]})
+        c = c[glms.models[feature].exog_names[:glms.models[feature].exog.shape[1]]]
+        c = np.pad(c, (0, max(len(glms.results[feature].params) - len(c), 0)), 'constant')
+        t_res = glms.results[feature].t_test(c)
+        means.append(glms.models[feature].link.inverse(t_res.effect.item()))
+        errors = t_res.conf_int().squeeze()
+        err_low.append(means[-1] - glms.models[feature].link.inverse(errors[0]))
+        err_high.append(glms.models[feature].link.inverse(errors[1]) - means[-1])
+        tmp = pd.concat([tmp, pd.DataFrame({'classification': [cat], 'mean': [means[-1] + err_high[-1]]})])
+
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    sns.stripplot(
+        x = 'classification',
+        y = 'mean', 
+        data = tmp,
+        order = order,
+        ax = ax,
+        facecolor = 'none',
+        edgecolor = 'none',
+    )
+
+    for i, (o, m, el, eh) in enumerate(zip(order, means, err_low, err_high)):
+        ax.errorbar(
+            o,  
+            m,
+            yerr = [[el], [eh]],
+            fmt = 'o',
+            linestyle = 'none',
+            c = f'C{i}'
+        )
+
+    annot = Annotator(ax, pairs, data = glms.features[feature], x = 'classification', y = 'rate', order = order)
+    annot.configure(test = None, text_format = 'full', show_test_name = False, verbose = 0, hide_non_significant = True)
+    annot.set_pvalues(ps)
+    annot.annotate()
+
+    ax.grid()
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.tick_params(axis = 'x', labelrotation = 45)
+    return ax
