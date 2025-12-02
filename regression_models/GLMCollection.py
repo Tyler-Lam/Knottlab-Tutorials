@@ -1,10 +1,11 @@
 from statsmodels_utils import *
 from BetaGLM import *
 from GammaGLM import *
-
+from NegativeBinomial import *
+from ZeroInflatedNegativeBinomial import *
 
 # Copied from Aagam's optimized code
-def _fit_single_model(model_name, model, fit_kwargs):
+def _fit_single_model(model_name, model, maxiter = 5000, fit_kwargs = {}):
     """
     Fits a single GLM model, handles convergence, and captures important warnings.
     Returns a tuple: (model_name, fit_result, convergence_status, list_of_warnings).
@@ -20,20 +21,55 @@ def _fit_single_model(model_name, model, fit_kwargs):
         try:
             # First fit attempt
             result = model.fit(**fit_kwargs)
-            converged = not np.isnan(result.bse).any()
-
+            converged = not np.isnan(result.bse).any() and result.mle_retvals['converged']
+            
+            # If not converged, try increasing the max-iterations
+            if not converged:
+                w.clear()
+                result = model.fit(maxiter = maxiter, **fit_kwargs)
+                converged = not np.isnan(result.bse).any() and result.mle_retvals['converged']
+                
+            # If that doesn't work, loop through different fit methods (sometimes this works?)
+            methods = ['bfgs', 'lbfgs', 'nm', 'newton', 'powell']
+            half_converged = [] # If we get finite coefficients but no variance/std error
+            if not converged:
+                if converged and not np.isnan(result.bse).any() :
+                    half_converged.append('bfgs')
+                for i, m in enumerate(methods[1:]):
+                    w.clear()
+                    result = model.fit(method = m, maxiter = maxiter, **fit_kwargs)
+                    converged = not np.isnan(result.bse).any() and not np.isnan(result.bse).any() 
+                    if converged:
+                        w.clear()
+                        break
+                    if not converged and not np.isnan(result.bse).any():
+                        half_converged.append(m)
+                        
+            # If no methods fully converged, use the first one with zero nan values
+            if not converged:
+                if len(half_converged) > 0:
+                    w.clear()
+                    warnings.warn(f"Fit failed with all methods. Using {half_converged[0]} method", UserWarning)
+                    result = model.fit(method = half_converged[0], maxiter = maxiter, **fit_kwargs)
+                    
         except Exception as e:
             # If fitting crashes, record the error as a warning and return failure
             important_warnings.append(f"Fit failed with error: {e}")
             return model_name, None, False, important_warnings
 
-        # After the fit, filter the captured warnings
-        for warn in w:
-            msg = str(warn.message).lower()
-            # Ignore common, non-critical numerical warnings
-            if 'encountered in subtract' in msg or 'df_resid' in msg:
-                continue
-            important_warnings.append(str(warn.message))
+    # After the fit, filter the captured warnings
+    for warn in w:
+        msg = str(warn.message).lower()
+        # Ignore common, non-critical numerical warnings
+        if 'encountered in subtract' in msg or'df_resid' in msg or 'divide by zero' in msg or 'invalid value encountered' in msg or 'overflow encountered' in msg:
+            continue
+        important_warnings.append(warnings.formatwarning(
+            warn.message,
+            warn.category,
+            warn.filename,
+            warn.lineno,
+            warn.line,)
+        )
 
     return (model_name, result, converged, important_warnings)
 
@@ -53,12 +89,20 @@ def _run_single_comparison(res, c_test, c_ref, name):
     y = res.model.endog
     x = res.model.exog
     
-    c_test = c_test[res.model.exog_names[:res.model.exog.shape[1]]]
-    c_ref = c_ref[res.model.exog_names[:res.model.exog.shape[1]]]
+    idx_t = set(c_test.index.values)
+    idx_t_new = [x for x in res.model.exog_names if x in idx_t]
+    idx_r = set(c_ref.index.values)
+    idx_r_new = [x for x in res.model.exog_names if x in idx_r]
+    c_test = c_test[idx_t_new]
+    c_ref = c_ref[idx_r_new]
     
-    if np.isnan(res.bse).any():
+    # If the result is not converged
+    if np.isnan(res.bse).any() or not res.mle_retvals['converged']:
         return (np.nan, np.nan, np.nan, np.nan, name)
-    
+    # If the comparison contains categories that were removed from the given model
+    if not idx_t.issubset(set(res.model.exog_names)) or not idx_r.issubset(set(res.model.exog_names)):
+        return (np.nan, np.nan, np.nan, np.nan, name)
+
     contrast = np.pad((c_test - c_ref).values, (0, max(len(res.params) - len(c_test), 0)), 'constant')
     res_wald = res.wald_test(contrast, scalar = True)
     res_t = res.t_test(contrast)
@@ -167,7 +211,7 @@ class GLMCollection():
             scale_col = f'annot{region}_area'
             info['counts_col'] = counts_col
             info['scale_col'] = scale_col
-            info['model_type'] = 'Gamma'
+            info['model_type'] = 'NegativeBinomial'
             return info
         
         # If column is spatial correlations
@@ -182,7 +226,7 @@ class GLMCollection():
             scale_col = c.replace("spatial_correlation", "expected_count")
             info['counts_col'] = counts_col
             info['scale_col'] = scale_col
-            info['model_type'] = 'Gamma'
+            info['model_type'] = 'NegativeBinomial'
             return info
             
         # For covering fraction
@@ -206,7 +250,7 @@ class GLMCollection():
         
     def add_models_batch(self, cols_to_add, skip = defaultdict(list), verbose = True, show_progress = True):
         """
-        Add all models to the GLMCollection
+        Add all models to the GLMCollection. From Aagam's modifications
         
         Parameters:
         ------------
@@ -253,41 +297,68 @@ class GLMCollection():
                 counts_col = meta['counts_col']
                 # --- A. Construct feature-specific aggregated DataFrame ---
                 agg_df = pd.DataFrame(self.agg_features[counts_col]).rename(columns={counts_col: 'counts'})
-
+                
+                # Require categories to have >=2 patients with nonzero counts
+                nonzero = agg_df.groupby(self.comparisons)['counts'].apply(lambda x: sum(x > 0)) >= 2
+                valid = nonzero[nonzero].index.to_frame(index = False)
+                if len(valid) <= 1:
+                    warnings.warn(f'Category {val_col} has less than 2 valid categories. Skipping model.', UserWarning)
+                    for warn in w:
+                        warning_list.append((val_col, warn.message))
+                    continue
+                
+                if len(valid) < len(nonzero):
+                    warnings.warn(f"Category {val_col} removed {len(nonzero) - len(valid)} invalid groups from design matrix", UserWarning)
+                    
                 if meta['model_type'] == 'Beta':
                     totals_col = meta['totals_col']
                     agg_df['total_counts'] = self.agg_features[totals_col]
                     agg_df = agg_df[agg_df['total_counts'] > 0].copy()
+                    agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
                     if agg_df.empty: 
                         warnings.warn(f'Category {val_col} has 0 nonzero total counts. Skipping model.', UserWarning)
+                        for warn in w:
+                            warning_list.append((val_col, warn.message))
                         continue
+                    # Adjust exact 0 and 1 proportions using Smithson and Verkuilen method
+                    # https://www.researchgate.net/publication/7184584_A_better_lemon_squeezer_Maximum-likelihood_regression_with_beta-distributed_dependent_variables
                     agg_df['rate'] = (agg_df['counts'] / agg_df['total_counts'] * (agg_df['total_counts'] - 1) + 0.5) / agg_df['total_counts']
 
                 elif meta['model_type'] == 'Gamma':
                     scale_col = meta['scale_col']
                     agg_df['scale'] = self.agg_features[scale_col]
                     agg_df = agg_df[agg_df['scale'] > 0].copy()
+                    agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
                     if agg_df.empty: 
                         warnings.warn(f'Category {val_col} has 0 nonzero total counts. Skipping model.', UserWarning)
+                        for warn in w:
+                            warning_list.append((val_col, warn.message))
                         continue
                     agg_df['rate'] = (agg_df['counts'] / agg_df['scale'])
-                    # For 0 gamma counts, add 0.5 and divide by scale to get the final rate
-                    agg_df.loc[agg_df['counts'] == 0, 'rate'] = 0.5 / agg_df.loc[agg_df['counts'] == 0]['scale']
+                    # For 0 gamma counts, add 0.1 counts and divide by scale to get the final rate
+                    # This can be weird sometimes so make sure you check values to see if they make sense
+                    #    e.g. adding .1 count to a small area can give a large density
+                    agg_df.loc[agg_df['counts'] == 0, 'rate'] = 0.1 / agg_df.loc[agg_df['counts'] == 0]['scale']
+                    
+                elif meta['model_type'] == 'NegativeBinomial' or meta['model_type'] == 'ZeroInflatedNegativeBinomial':
+                    scale_col = meta['scale_col']
+                    agg_df['scale'] = self.agg_features[scale_col]
+                    agg_df = agg_df[agg_df['scale'] > 0].copy()
+                    agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
+                    if agg_df.empty: 
+                        warnings.warn(f'Category {val_col} has 0 nonzero total counts. Skipping model.', UserWarning)
+                        for warn in w:
+                            warning_list.append((val_col, warn.message))
+                        continue
+                    agg_df['rate'] = (agg_df['counts'] / agg_df['scale'])
+                    agg_df.loc[agg_df['counts'] == 0, 'rate'] = agg_df.loc[agg_df['counts'] > 0]['rate'].min()
                     
                 agg_df.reset_index(inplace=True)
                 agg_df['classification'] = agg_df.apply(lambda x: '___'.join([f'{c}__{x[c]}' for c in self.comparisons]), axis=1)
 
                 self.features[val_col] = agg_df
-                valid_category = self.features[val_col].groupby('classification')['rate'].apply(lambda x: sum(x > 0)) >= 2
-                
-                if sum(valid_category) < len(valid_category):
-                    warnings.warn(f'Category has group with < 2 nonzero proportions. Skipping model.', UserWarning)
-                    continue
                 
                 # --- B. Validate and create the model object ---
-                if len(agg_df['classification'].unique()) < len(self.features_raw[self.comparisons].drop_duplicates()):
-                    warnings.warn(f'Category {val_col} has group with 0 nonzero total counts. Skipping model.', UserWarning)
-                    continue
 
                 if meta['model_type'] == 'Beta':
                     y, X = dmatrices(f'rate ~ {self.formula}', agg_df, return_type = 'dataframe')
@@ -296,6 +367,7 @@ class GLMCollection():
                     else:
                         null_Y, null_X = dmatrices(f'rate ~ {self.null_formula}', data = agg_df, return_type = 'dataframe')
                     # Edge cases: dropping exog columns with only 1 value
+                    # For example if all patients are HPV+ then we remove the HPV column from the design matrix
                     for col in X.columns[1:]:
                         if X[col].nunique() <= 1:
                             X = X.drop(col, axis = 1)
@@ -322,9 +394,38 @@ class GLMCollection():
                     
                     self.models[val_col] = GammaGLM(y, X)
                     self.models_null[val_col] = GammaGLM(y, null_X)
+
+                elif meta['model_type'] == 'NegativeBinomial':
+                    y, X = dmatrices(f'counts ~ {self.formula}', agg_df, return_type = 'dataframe')
+                    offset = np.log(agg_df['scale'])
+                    if self.null_formula is None:
+                        null_X = sm.add_constant(pd.DataFrame({"const": 1}, index = agg_df.index))
+                    else:
+                        null_Y, null_X = dmatrices(f'counts ~ {self.null_formula}', data = agg_df, return_type = 'dataframe')
+                    # Edge cases: dropping exog columns with only 1 value
+                    for col in X.columns[1:]:
+                        if X[col].nunique() <= 1:
+                            X = X.drop(col, axis = 1)
+                    for col in null_X.columns[1:]:
+                        if null_X[col].nunique() <= 1:
+                            null_X = null_X.drop(col, axis = 1)
                     
+                    # If a model has more zeros than expected, use a zero-inflated model
+                    # Otherwise use a standard negative binomial
+                    # Predict using the method of moments estimate
+                    mu = (agg_df['counts'] / agg_df['scale']).mean()
+                    var = (agg_df['counts'] / agg_df['scale']).std()**2
+                    alpha_MOM = (var - mu) / (mu**2) #since var = mu + alpha * mu^2
+                    pct_zero_exp = (1 / (1 + alpha_MOM * mu))**(1/alpha_MOM)
+                    pct_zero = sum(agg_df['counts'] == 0) / len(agg_df['counts'])
+                    if (pct_zero > 1.5 * pct_zero_exp and pct_zero > pct_zero_exp + 0.05) or pct_zero > 0.1:
+                        self.models[val_col] = ZeroInflatedNegativeBinomialCustom(y, X, offset = offset)
+                        self.models_null[val_col] = ZeroInflatedNegativeBinomialCustom(y, null_X, offset = offset)
+                    else:
+                        self.models[val_col] = NegativeBinomialCustom(y, X, offset = offset)
+                        self.models_null[val_col] = NegativeBinomialCustom(y, null_X, offset = offset)
+
                 for warn in w:
-                    #if 'category has group' in str(warn.message).lower():
                     warning_list.append((val_col, warn.message))
                         
         if verbose:
@@ -343,11 +444,11 @@ class GLMCollection():
             n_jobs = multiprocessing.cpu_count() - 1
             
         if n_jobs == 1:
-            results = [_fit_single_model(name, model, fit_kwargs) for name, model in tqdm(self.models.items(), desc = "Fitting full models", disable = not show_progress)]
+            results = [_fit_single_model(name, model, fit_kwargs = fit_kwargs) for name, model in tqdm(self.models.items(), desc = "Fitting full models", disable = not show_progress)]
         
         else:
             tasks = [
-                delayed(_fit_single_model)(name, model, fit_kwargs)
+                delayed(_fit_single_model)(name, model, fit_kwargs = fit_kwargs)
                 for name, model in self.models.items()
             ]
             
@@ -367,9 +468,6 @@ class GLMCollection():
             for idx, warning in warning_list:
                 print(f'   warning when fitting {idx}: {warning}')
         self.isfit = True
-        if verbose:
-            print("Finished fitting full models")
-
 
     def fit_null_models_parallel(self, n_jobs = None, verbose = True, show_progress = True, fit_kwargs = {}):
         
@@ -377,10 +475,10 @@ class GLMCollection():
             n_jobs = multiprocessing.cpu_count() - 1
             
         if n_jobs == 1:
-            results = [_fit_single_model(name, model, fit_kwargs) for name, model in tqdm(self.models_null.items(), desc = "Fitting full models", disable = not show_progress)]
+            results = [_fit_single_model(name, model, fit_kwargs = fit_kwargs) for name, model in tqdm(self.models_null.items(), desc = "Fitting full models", disable = not show_progress)]
         else:
             tasks = [
-                delayed(_fit_single_model)(name, model, fit_kwargs)
+                delayed(_fit_single_model)(name, model, fit_kwargs = fit_kwargs)
                 for name, model in self.models_null.items()
             ]
             
@@ -400,9 +498,6 @@ class GLMCollection():
             for idx, warning in warning_list:
                 print(f'   warning when fitting {idx}: {warning}')
         self.isfit_null = True
-        if verbose: 
-            print("Finished fitting null models")
-
 
     def resid(self, **kwargs):
         """
@@ -439,7 +534,13 @@ class GLMCollection():
         
         contrast = self.fc.cond(**kwargs)
         if model is not None and model in self.models:
-            contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
+            try:
+                with warnings.catch_warnings(record = True) as w:
+                    warnings.simplefilter('always')
+                    fc = FormulaicContrasts(self.features[model], f'~ {self.formula}')
+                    contrast = fc.cond(**kwargs)
+            except:
+                pass
         return contrast
     
     def cond_null(self, model = None, **kwargs):
@@ -460,7 +561,13 @@ class GLMCollection():
         
         contrast = self.fc_null.cond(**kwargs)
         if model is not None and model in self.models_null:
-            contrast = contrast[self.models_null[model].exog_names[:self.models_null[model].exog.shape[1]]]
+            try:
+                with warnings.catch_warnings(record = True) as w:
+                    warnings.simplefilter('always')
+                    fc = FormulaicContrasts(self.features[model], f'~ {self.null_formula}')
+                    contrast = fc.cond(**kwargs)
+            except:
+                pass
         return contrast
 
     def plot_model(self, model, fitted = False, order = None, logy = False, cbar_label = '', ax_label = '', figsize = (8, 10), show = True, save_dir = None):
@@ -533,16 +640,18 @@ class GLMCollection():
                 # Get col: val pairs from the classification names
                 vals ={x.split('__')[0]: self.features[model][x.split('__')[0]].dtype.type(x.split('__')[1]) for x in cat.split('___')}
                 # Use col: val pairs to get the given contrast
-                contrast = self.cond(**vals)
+                contrast = self.cond(model = model, **vals)
                 # Sometimes the contrast orders don't match. Fix that here:
-                contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
+                idx = set(contrast.index.values)
+                idx_new = [x for x in self.models[model].exog_names if x in idx]
+                contrast = contrast[idx_new]
                 result = self.results[model]
                 pdfs[cat] = result.get_pdf(x, contrast)
                 pdf_max = max(pdf_max, pdfs[cat][np.isfinite(pdfs[cat])].max())
 
                 ax[0].plot(x, pdfs[cat], '-')
                 
-            ax[0].set_ylim(None, ymax if (ymax < pdf_max) else 1.2*ymax)
+            ax[0].set_ylim(None, ymax if (ymax < pdf_max) else min(1.2 * pdf_max, 2*ymax))
         # Histogram plot formatting
         ax[0].set_ylabel("a.u.")
         ax[0].set_xlabel(ax_label)
@@ -589,8 +698,8 @@ class GLMCollection():
             for i, cat in enumerate(x_pos.keys()):
                 ax[1].fill_betweenx(
                     x, 
-                    x_pos[cat] - 0.45 * np.clip(pdfs[cat], a_min = None, a_max = ymax)/pdf_max, 
-                    x_pos[cat] + 0.45 * np.clip(pdfs[cat], a_min = None, a_max = ymax)/pdf_max, 
+                    x_pos[cat] - 0.45 * np.clip(pdfs[cat], a_min = None, a_max = 2*ymax)/min(2*ymax, pdf_max), 
+                    x_pos[cat] + 0.45 * np.clip(pdfs[cat], a_min = None, a_max = 2*ymax)/min(2*ymax, pdf_max), 
                     alpha = 0.3, 
                     color = f'C{i}'
                 )
@@ -610,7 +719,7 @@ class GLMCollection():
 
     def plot_model_no_hist(self, model, fitted = False, order = None, logy = False, cbar_label = '', ax_label = '', figsize = (8, 10), show = True, ax = None, save_dir = None, title = ''):
         """
-        Plot the distribution of data for a given model. Top plot is a normalized histogram for each feature category (unstacked). Bottom plot is a strip + violin plot with points colored by the denominator (total_counts or scale)
+        Plot the distribution of data for a given model. Only plot the strip + violin plot
         
         Parameters:
         ------------
@@ -665,7 +774,7 @@ class GLMCollection():
                 # Get col: val pairs from the classification names
                 vals ={x.split('__')[0]: self.features[model][x.split('__')[0]].dtype.type(x.split('__')[1]) for x in cat.split('___')}
                 # Use col: val pairs to get the given contrast
-                contrast = self.cond(**vals)
+                contrast = self.cond(model = model, **vals)
                 # Sometimes the contrast orders don't match. Fix that here:
                 contrast = contrast[self.models[model].exog_names[:self.models[model].exog.shape[1]]]
                 result = self.results[model]
@@ -739,22 +848,17 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * c_test, c_ref (pd.Series): contrast vectors for test and ref classes, given from self.cond()
+        * c_test, c_ref (dict): Dictionaries defining contrast vectors for test and ref classes
         * name: Name of the current comparison
         """
-        
-        if isinstance(c_test, dict):
-            c_test = self.cond(**c_test)
-        if isinstance(c_ref, dict):
-            c_ref = self.cond(**c_ref)
-            
+
         if n_jobs is None:
             n_jobs = multiprocessing.cpu_count() - 1
             
         if n_jobs == 1:
-            results = [_run_single_comparison(res, c_test, c_ref, name) for name, res in self.results.items()]
+            results = [_run_single_comparison(res, self.cond(model = feat, **c_test), self.cond(model = feat, **c_ref), feat) for feat, res in self.results.items()]
         else:
-            tasks = [delayed(_run_single_comparison)(res, c_test, c_ref, name) for name, res in self.results.items()]
+            tasks = [delayed(_run_single_comparison)(res, self.cond(model = feat, **c_test), self.cond(model = feat, **c_ref), feat) for feat, res in self.results.items()]
             results = Parallel(n_jobs = n_jobs)(tasks)
             
         out_index = []
@@ -781,15 +885,15 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * contrasts (List[dict]): List of contrast info. {'test': test_contrast, 'ref': ref_contrast, 'name': name}. Contrasts must be either pd.Series or dictionaries defining the classes
+        * contrasts (List[dict]): List of contrast info. {'test': test_contrast, 'ref': ref_contrast, 'name': name}. Contrasts must be dictionaries defining the classes
         """     
         out = defaultdict(dict)
+        if not isinstance(contrasts, list):
+            contrasts = [contrasts]
         for c in tqdm(contrasts, desc = 'Getting stat dataframes', disable = not show_progress):
             out[c['name']] = self.get_stat_df_parallel(c['test'], c['ref'], c['test'], n_jobs = n_jobs)   
-            if isinstance(c['ref'], dict):
-                out[c['name']]['ref_group'] = c['ref']
-            if isinstance(c['test'], dict):
-                out[c['name']]['test_group'] = c['test']
+            out[c['name']]['ref_group'] = c['ref']
+            out[c['name']]['test_group'] = c['test']
         return out
 
     def run_stats_pairwise(self, **kwargs):
@@ -819,16 +923,11 @@ class GLMCollection():
 
                     name = "___".join([name, f'{"___".join([f"{key}__{val}" for key, val in self.preselection.items()])}'])
 
-                    c_test = self.cond(**cont_test)
-                    c_ref = self.cond(**cont_ref)
-                    contrasts.append({'name': name, 'test': c_test, 'ref': c_ref})
+                    contrasts.append({'name': name, 'test': cont_test, 'ref': cont_ref})
                     metadata[name]['comparison'] = comp
                     # Dictionaries for contrasts
                     metadata[name]['test_group'] = cont_test
                     metadata[name]['ref_group'] = cont_ref
-                    # Contrast vectors
-                    metadata[name]['c_test'] = c_test
-                    metadata[name]['c_ref'] = c_ref
                     # Dictionary of control variables
                     metadata[name]['control'] = {key: val for key, val in self.preselection.items()}
                     
@@ -848,17 +947,12 @@ class GLMCollection():
                             name += f'___{c}__{row[c]}'
                         name = "___".join([name, f'{"___".join([f"{key}__{val}" for key, val in self.preselection.items()])}'])
 
-                        c_test = self.cond(**cont_test)
-                        c_ref = self.cond(**cont_ref)
-                        contrasts.append({'name': name, 'test': c_test, 'ref': c_ref})
+                        contrasts.append({'name': name, 'test': cont_test, 'ref': cont_ref})
                         metadata[name] = {}
                         metadata[name]['comparison'] = comp
                         # Dictionaries for contrasts
                         metadata[name]['test_group'] = cont_test
                         metadata[name]['ref_group'] = cont_ref
-                        # Contrast vectors
-                        metadata[name]['c_test'] = c_test
-                        metadata[name]['c_ref'] = c_ref
                         # Dictionary of control variables
                         metadata[name]['control'] = {c: row[c] for c in others}
                         metadata[name]['control'].update({key: val for key, val in self.preselection.items()})
@@ -885,21 +979,18 @@ class GLMCollection():
                 return self.run_stats_pairwise()
 
         contrasts = []
+        
         # Get the contrast vector for the given reference class
-        c_ref = self.cond(**ref_class)
         
         # Mask the reference class rows from the feature dataframe so we can loop over all other unique combinations of predictors
         mask = ~(self.features_raw[list(ref_class)] == pd.Series(ref_class)).all(axis = 1)
         for idx, row in self.features_raw[mask][self.comparisons].drop_duplicates().dropna().iterrows():
             test_class = {c: row[c] for c in self.comparisons}
-            c_test = self.cond(**test_class)
             
             name = '___'.join([f"{c}__{row[c]}" for c in self.comparisons])
-            contrasts.append({'name': name, 'test': c_test, 'ref': c_ref})
+            contrasts.append({'name': name, 'test': test_class, 'ref': ref_class})
             metadata[name]['ref_group'] = ref_class
             metadata[name]['test_group'] = test_class
-            metadata[name]['c_test'] = c_test
-            metadata[name]['c_ref'] = c_ref
         stat_res = self.run_stats_with_contrasts(contrasts, **kwargs)
         for key in stat_res:
             stat_res[key].update(metadata[key])
@@ -950,7 +1041,9 @@ class GLMCollection():
         
         Parameters:
         ------------
-        * perm_cols: Columns
+        * df: Pandas dataframe of all aggregated features and metadata
+        * perm_cols: Columns to permute (if none, permute all patients)
+        * random_state: for reproducibility when shuffling (needed to calculate correlation between features)
         """
         warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
 
@@ -965,7 +1058,7 @@ class GLMCollection():
         rng = np.random.default_rng(random_state)
         shuffle_dict = dict(zip(shuffled_df['tmp_idx'], rng.permutation(shuffled_df['tmp_idx'])))
         shuffled_df['tmp_idx'] = shuffled_df['tmp_idx'].map(shuffle_dict)
-        
+
         # Re-merge the shuffled metadata and drop the temporary index
         df['tmp_idx'] = df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
         df = df.drop(columns = perm_cols)
@@ -975,13 +1068,16 @@ class GLMCollection():
         
         return df
         
-    def _run_single_permutation(self, contrasts = None, n_jobs = None, group_cols = None, perm_cols = None, random_state = None):
+    def _run_single_permutation(self, contrasts = None, n_jobs = None, group_cols = None, perm_cols = None, random_state = None, verbose = False):
         """
         Run the statistical analysis on a single permutation. Shuffle the patients by group_key and get the stat dataframes for each comparison
         
         Parameters:
         ------------
         * contrasts (List[dict]): List of dictionaries with contrast info. Contrasts must have 3 keys: 'name' to match the name of the comparison from the actual data stat res, 'test' and 'ref': contrasts for the test and ref groups (as pd.Series)
+        * n_jobs: Number of jobs for single permutation (inner parallelization)
+        * group_cols, perm_cols: Columns to group and to shuffle.
+                                 Example: If I want to shuffle HPV status within diagnosis stages, I would use group_cols = 'Diagnosis' and perm_cols = 'HR_HPV'
         """
         
         with warnings.catch_warnings(record = True) as w:
@@ -1019,19 +1115,25 @@ class GLMCollection():
                     out_res[idx] = out_res[idx][[c for c in out_res[idx].columns if c.startswith('t-') or c in ['Celltype', 'Region', 'feature_type']]]
                 # Run the pseudo-anova log-likelihood test
                 out_res['llr'] = glms.run_LLR_test()
-                
-                for warn in w:
-                    msg = str(warn.message).lower()
-                    if 'stopped while some jobs were given to the executor' in msg:
-                        continue
-                    print(warn.message)
-                return out_res
             
             except Exception as e:
-                for warn in w:
-                    print(warn.message)
                 print(f"   Permutation fitting failed: {e}")
                 return None
+        
+        if verbose:
+            for warn in w:
+                msg = str(warn.message).lower()
+                # Filter common warnings that clutter the output
+                if 'stopped while some jobs were given to the executor' in msg or 'encountered in subtract' in msg or'df_resid' in msg or 'divide by zero' in msg or 'invalid value encountered' in msg or 'overflow encountered' in msg:
+                    continue
+                print(warnings.formatwarning(
+                    warn.message,
+                    warn.category,
+                    warn.filename,
+                    warn.lineno,
+                    warn.line,
+                ))
+        return out_res
     
     def run_permutations_parallel(self, contrasts = None, n_permutations = 1000, show_progress = True, n_jobs = None, n_jobs_inner = None, random_state = None, **kwargs):
         """
@@ -1043,6 +1145,8 @@ class GLMCollection():
         * n_permutations: Number of permutations to run
         * n_jobs: Number of jobs to run for permutation tests
         * n_jobs_inner: Number of jobs to run within each permutation test. Since we can't do nested parallelism, either this or n_jobs must be set to 1
+        * random_state: seed for reproducibility
+        * kwargs: arguments for _run_single_permutation()
         """
         out = defaultdict(pd.DataFrame)
 
@@ -1067,11 +1171,17 @@ class GLMCollection():
                 with tqdm_joblib(tqdm(desc = "Calculating permutations", total = len(tasks), disable = not show_progress)) as pbar:
                     results = Parallel(n_jobs = n_jobs)(tasks)
                         
-            for warn in w:
-                msg = str(warn.message).lower()
-                if 'stopped while some jobs were given to the executor' in msg:
-                    continue
-                print(warn.message)
+        for warn in w:
+            msg = str(warn.message).lower()
+            if 'stopped while some jobs were given to the executor' in msg:
+                continue
+            print(warnings.formatwarning(
+                warn.message,
+                warn.category,
+                warn.filename,
+                warn.lineno,
+                warn.line,
+            ))         
                 
         # Loop over the results and make the output dictionary of dataframes
         for n, permutation_res in enumerate(results):
@@ -1079,7 +1189,9 @@ class GLMCollection():
                 continue
             for key in permutation_res:
                 tmp_df = permutation_res[key].copy()
-                tmp_df['perm_iter'] = n
+                # Track which permutation the results are from
+                # Works since joblib parallel preserves the order of tasks. No need to track random state within each task
+                tmp_df['perm_iter'] = n 
                 out[key] = pd.concat([out[key], tmp_df], axis = 0, join = 'outer')
         return out
     
@@ -1088,18 +1200,23 @@ class GLMCollection():
         Run the statistical test with permutations for empirical p-values
         Empirical p-values are calculated as the fraction of null test statistics greater than the nominal wald test statistic. These are saved as p-wald-nom (or p-nom for the LLR test)
         
-        (UPDATE: We no longer do this part) This is analogous to the Storey-Tribshirani multiple-trials correction, and what GSEA uses for phenotype permutation tests
-        https://pubmed.ncbi.nlm.nih.gov/12883005/
+        (UPDATE: We no longer do this part. See the tutorial for Benjamini-Bogomolov FDR correction) ~~FDR correction is analogous to the Storey-Tribshirani multiple-trials correction, and what GSEA uses for phenotype permutation tests
+        https://pubmed.ncbi.nlm.nih.gov/12883005/~~
         
         Parameters:
         ------------
         * n_permutations, n_jobs, verbose are the same as the run_permutations() function
+        * n_jobs, n_jobs_inner: number of jobs for inner/outer parallelization. Due to joblib we can either do inner or outer parallelization, but not both
         * contrasts (List[dict] / dict): Contrast metadata dictionary defining the groups for pairwise comparisons
-        * do_pairwise: If contrasts is None, do pairwise comparisons.
+        * do_pairwise: If contrasts is None, do pairwise comparisons. If False and contrasts is None, only perform the LLR test and skip pairwise comparisons
         * ref_class (dict): Dictionary specifying the reference class predictors. If none, do all pairwise comparisons
+        * kwargs: Keyword arguments for _run_single_permutation()
         """
 
+        # Setup output dictionary
         stat_res = {}
+        
+        # Run comparisons if no contrasts provided
         if contrasts is None:
             contrasts = []
             if do_pairwise:
@@ -1108,22 +1225,26 @@ class GLMCollection():
                 
                 # Get all contrasts from the original stat results
                 for key in stat_res:
-                    contrasts.append(dict(name = key, test = stat_res[key]['c_test'], ref = stat_res[key]['c_ref']))
+                    contrasts.append(dict(name = key, test = stat_res[key]['test_group'], ref = stat_res[key]['ref_group']))
+        # Run comparisons if contrasts are given
         else:
             if not isinstance(contrasts, list):
                 contrasts = [contrasts]
             stat_res = self.run_stats(contrasts=contrasts)
             
         # Run permutations
+        
+        # Setup job distribution
+        # Default to outer parallelization
         if n_jobs is None:
-            n_jobs = 1
-            
+            n_jobs = multiprocessing.cpu_count() - 1
         if n_jobs_inner is None:
             n_jobs_inner = (multiprocessing.cpu_count() - 1) // n_jobs
         n_jobs_inner = min((multiprocessing.cpu_count() - 1) // n_jobs, n_jobs_inner)
         
         perm_df = self.run_permutations_parallel(contrasts, n_permutations=n_permutations, show_progress=show_progress, n_jobs = n_jobs, n_jobs_inner = n_jobs_inner, **kwargs)
         warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
+        
         # Function to calculate empirical p-values given a dataframe
         def calculate_empirical_fdr(df, perm_df, stat_col = 'stat'):
             
@@ -1138,7 +1259,8 @@ class GLMCollection():
                 df.loc[mask, 'p-nom'] = np.nan      # Empirical p-value using null dist from specific feature
                 return df
             
-            # Apply nominal p-value: fraction of null distribution greater or equal to T for the specific feature
+            # Calculate nominal p-value: fraction of null distribution greater or equal to T for the specific feature
+            # +1 corrections are to keep p > 0
             df.loc[mask, 'p-nom'] = [(np.sum(perm_df[perm_df.index == idx][stat_col] > val)+1) / (len(perm_df[perm_df.index == idx])+1) for idx, val in df.loc[mask, stat_col].items()]
             return df
 
@@ -1156,7 +1278,7 @@ class GLMCollection():
         stat_res['llr'] = {'df': llr_df, 'perm_df': perm_df['llr']}
         return stat_res
 
-    def test_run(self, n_perm = 1000):
+    def test_run(self, n_perm = 1000, random_state = 42):
         """
         Test to see if inner or outer parallelism would be faster for the given number of permutations
         Inner parallelism = parallelism within each permutation, permutations run in series
@@ -1167,14 +1289,14 @@ class GLMCollection():
         print("Running test permutations to job allocation")
         print("   Running test with inner parallelism", end = ' ... ')
         t0 = time.time()
-        test = self.run_permutations_parallel(n_permutations = 1, n_jobs = 1, n_jobs_inner = multiprocessing.cpu_count() - 1, show_progress=False)
+        test = self.run_permutations_parallel(n_permutations = 1, n_jobs = 1, n_jobs_inner = multiprocessing.cpu_count() - 1, show_progress=False, random_state = random_state)
         t1 = time.time()
         
         t_inner_iter = t1 - t0
         print(f"done: {t_inner_iter:.2f} s")
         print("   Running test with outer parallelism", end = " ... ")
         t0 = time.time()
-        test = self.run_permutations_parallel(n_permutations = multiprocessing.cpu_count() - 1, n_jobs = multiprocessing.cpu_count() - 1, n_jobs_inner = 1, show_progress=False)
+        test = self.run_permutations_parallel(n_permutations = multiprocessing.cpu_count() - 1, n_jobs = multiprocessing.cpu_count() - 1, n_jobs_inner = 1, show_progress=False, random_state = random_state)
         t1 = time.time()
 
         t_outer_iter = t1 - t0

@@ -28,6 +28,9 @@ from matplotlib import colors, gridspec
 
 from statsmodels.base.model import GenericLikelihoodModel, GenericLikelihoodModelResults
 from statsmodels.othermod.betareg import BetaModel, BetaResults, BetaResultsWrapper
+from statsmodels.discrete.discrete_model import NegativeBinomial, NegativeBinomialResults
+from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP, ZeroInflatedNegativeBinomialResults
+
 from statsmodels.genmod.generalized_linear_model import GLMResults
 from scipy.special import betaln
 from scipy.special import gammaln
@@ -276,14 +279,14 @@ def plot_progression_heatmap(
     * index: Columns used to index the pivot table
     * columns: Col name to use a columns for the pivot table
     * values: Values for the pivot table
-    * signif (pd.Series): Column in llr_df to indicate significance. If none, use llr_df[pval_col] <= 0.05
-    * ncols: Number of columns to use for celltype legend. Values >1 only really works for niches
+    * signif_col: Column in llr_df to indicate significance. If none, use llr_df[pval_col] <= 0.05
+    * ncols: Number of columns to use for celltype legend. (Values > 1 only really work for niches)
     * vmax: Maximum value for heatmap normalization
     * title: Title for the plot
     * xlabel: Label for the x-axis (defaults to "columns" parameter)
     * cbar_label: Label for the colorbar
-    * row_cluster: Cluster the rows and plot with a dendrogram. Otherwise order the rows based on the index
-    * pval_col: Column name for feature p-value labels on clustermap
+    * row_cluster: Cluster the rows and plot with a dendrogram. Otherwise order rows based on the index
+    * pval_col: Column name for feature-wise p-value labels on clustermap
     * cbar_width: width of colorbar
     * cbar_height: maximum height of colorbar
     * order: Left to right order for the columns
@@ -291,8 +294,8 @@ def plot_progression_heatmap(
 
     # Make the pivot table for the clustermap
     pivot = stat_df.pivot(index = index, columns = columns, values = values)
-    mask = pivot.sum(axis = 1) == 0 # Remove columns without comparisons
-    pivot = pivot[~mask]
+    pivot = pivot.dropna(axis = 0, how = 'all') # Remove rows with all nan values
+    pivot = pivot.fillna(0)
     pivot = pivot.sort_index(level = range(len(index)))
     
     if order is None:
@@ -300,7 +303,7 @@ def plot_progression_heatmap(
         
     if len(pivot) == 0:
         return
-    if len(pivot) == 1:
+    elif len(pivot) == 1:
         row_cluster = False
         
     # Set colormaps depending on size of celltype classes
@@ -440,13 +443,15 @@ def plot_progression_heatmap(
     else:
         plt.close()
 
-# Fast correlation calculations to handle NaN values in permutation test statistics
+# Correlation calculations to handle NaN values in permutations
+# Using numba loops is much faster than scipy.spearmanr for each pair of features
 from numba import njit, prange
 @njit(parallel = True)
 def fast_corr(X):
     n, m = X.shape
     res = np.empty((m, m), dtype = np.float32)
     
+    # Loop over pairs of rows
     for i in prange(m):
         res[i, i] = 1.0
         for j in range(i+1, m):
@@ -472,6 +477,7 @@ def fast_corr(X):
             var_j = 0.0
             
             for k in range(n):
+                # Skip nans
                 if not np.isnan(X[k,i]) and not np.isnan(X[k,j]):
                     di = X[k,i] - mean_i
                     dj = X[k,j] - mean_j
@@ -499,8 +505,17 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False):
+    """
+    Run benjamini bogomolov FDR correction
     
+    Parameters:
+    ------------
+    * perm_df: permutation dataframe. Must have a 'feature', 'stat', and 'perm_iter' column
+    * llr_df: Log likelihood-ratio dataframe
+    * alpha: significance threshold
+    * plot_threshold: Plot silhouette score vs threshold for clustering
+    """
     t_start = time.time()
     print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
     # Filter the permutation df to only use features in the llr df
@@ -520,18 +535,22 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05):
     dist = 1 - corr
     dist_condensed = squareform(dist)
     print(f"done: {(time.time() - t0) / 60:.2f} min")
-    Z = linkage(dist_condensed, method = 'average') # Unsure if 'average' is proper for this but idk
+    Z = linkage(dist_condensed, method = 'average') # Unsure if 'average' is proper for this but i guess it works
     
     # Calculate best threshold for clustering:
     best_labels = []
     best_score = 0
     best_t = 0
+    thresholds = []
+    scores = []
     for t in tqdm(np.linspace(0, 1, 200), desc = "Calculating best clustering threshold"):
 
         labels = fcluster(Z, t = t, criterion='distance')
         n_clusters = len(np.unique(labels))
         if n_clusters > 1 and n_clusters < len(corr):
             score = silhouette_score(dist, labels = labels, metric = 'precomputed')
+            thresholds.append(t)
+            scores.append(score)
             if score > best_score:
                 best_t = t
                 best_score = score
@@ -539,6 +558,15 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05):
 
     print(f"   Clustering at threshold t = {best_t:.3f}")
     
+    if plot_threshold:
+        fig, ax = plt.subplots()
+        ax.plot(thresholds, scores)
+        ax.axvline(x = best_t, color = 'r', linestyle = '--', label = f'Best threshold = {best_t:.3f}')
+        ax.set_xlabel("Threshold")
+        ax.set_ylabel("Silhouette score")
+        ax.legend()
+        plt.show()
+        
     # Add labels to correlation dataframe
     corr_df['cluster'] = best_labels
     # Add labels to the LLR df
@@ -552,10 +580,13 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05):
     clusters_df = clusters_df.groupby('cluster').apply(lambda g: apply_fdr(g))
     clusters_df.index = clusters_df.index.get_level_values(1)
     
+    # Get number of significant groups (R) and total groups (m)
     R = len(simes_df[simes_df <= alpha])
     m = len(simes_df)
+    alpha_adj = alpha * R / m # Adjusted feature significance threshold from BB method
     
-    signif = (clusters_df['p-simes'] <= alpha) & (clusters_df['cluster-p-adj'] <= alpha * R / m)
+    # Require feature to be in significant cluster and have cluster fdr corrected p-value below adjusted threshold
+    signif = (clusters_df['p-simes'] <= alpha) & (clusters_df['cluster-p-adj'] <= alpha_adj)
     
     clusters_df['signif'] = signif
     clusters_df['fdr-q-val'] = clusters_df['cluster-p-adj'].apply(lambda x: min(x * m / R, 1) if R > 0 else 1)
@@ -563,12 +594,12 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05):
     return clusters_df
 
 
-
-def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax = None, title = ""):
+def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax = None, title = "", hide_non_significant = True):
     """
     Plot the posthoc comparisons using means of the fits and pairwise comparisons
     
     Parameters:
+    -----------
     * glms (GLMCollection): fitted GLMCollection for all models
     * pvals (pd.DataFrame): posthoc dataframe (formatted as shown in tutorial notebook)
     * feature (str): Feature name for comparison
@@ -621,7 +652,7 @@ def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax =
         )
 
     annot = Annotator(ax, pairs, data = glms.features[feature], x = 'classification', y = 'rate', order = order)
-    annot.configure(test = None, text_format = 'full', show_test_name = False, verbose = 0, hide_non_significant = True)
+    annot.configure(test = None, text_format = 'full', show_test_name = False, verbose = 0, hide_non_significant = hide_non_significant)
     annot.set_pvalues(ps)
     annot.annotate()
 
@@ -629,4 +660,33 @@ def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax =
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.tick_params(axis = 'x', labelrotation = 45)
+    return ax
+
+
+def plot_test_stat(perm_df, stat_df, model, stat_col = 'stat', ax = None):
+    """
+    Function to plot a histogram of the permutation dataframe test statistics
+    Draws a vertical line at the location of the observed log likelihood
+    
+    Parameters:
+    ------------
+    * perm_df: Dataframe containing permutation results for all models
+    * stat_df: Dataframe with observed test statistics
+    * model (str): Name of feature/model to plot
+    * stat_col: Name of test statistic column in dataframes
+    * ax: (optional) matplotlib axis for plotting
+    """
+    if ax is None:
+        fig, ax = plt.subplots()
+    sns.histplot(
+        x = stat_col,
+        data = perm_df[perm_df['index'] == model],
+        stat = 'probability',
+        label = 'Permutation Tests'
+    )
+    ax.axvline(stat_df.loc[model][stat_col], color = 'red', linestyle = '--', label = 'Obs')
+    ax.legend()
+    ax.set_xlabel("Test Stat")
+    ax.set_ylabel("a.u.")
+    ax.set_title("Log Likelihood Ratios")
     return ax
