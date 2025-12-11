@@ -16,6 +16,8 @@ FDR correction is performed after running all models using the Benjamini Bogomol
 
 Once a feature is found to be significant, the current practice is to perform post-hoc pairwise comparisons, to see which specific comparisons are driving the significance. These need to be FDR corrected within each feature but not between different features. 
 
+Caveat: Most of these aren't actually GLMs but since they were used in the original version the name stuck
+
 ### Scripts
 
 1. `BetaGLM.py`, `GammaGLM.py`, `NegativeBinomial.py`, and `ZeroInflatedNegativeBinomial.py` - python scripts that use statsmodels base models to perform beta regression and gamma regression respectively
