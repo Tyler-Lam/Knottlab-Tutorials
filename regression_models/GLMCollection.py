@@ -54,7 +54,7 @@ def _fit_single_model(model_name, model, maxiter = 5000, fit_kwargs = {}):
                     
         except Exception as e:
             # If fitting crashes, record the error as a warning and return failure
-            important_warnings.append(f"Fit failed with error: {e}")
+            important_warnings.append(f"Fit failed with error: {e}\n{traceback.format_exc()}")
             return model_name, None, False, important_warnings
 
     # After the fit, filter the captured warnings
@@ -1066,6 +1066,7 @@ class GLMCollection():
             
             except Exception as e:
                 print(f"   Permutation fitting failed: {e}")
+                traceback.print_exc()
                 return None
         
         if verbose:

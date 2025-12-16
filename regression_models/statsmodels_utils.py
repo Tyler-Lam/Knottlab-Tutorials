@@ -23,6 +23,7 @@ from pathlib import Path
 import os
 import re
 import multiprocessing
+import traceback
 from matplotlib.colors import SymLogNorm, Normalize
 from matplotlib import colors, gridspec
 
@@ -505,7 +506,7 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, nan_behavior = 'omit'):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', nan_behavior = 'omit'):
     """
     Run benjamini bogomolov FDR correction
     
@@ -515,6 +516,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, n
     * llr_df: Log likelihood-ratio dataframe
     * alpha: significance threshold
     * plot_threshold: Plot silhouette score vs threshold for clustering
+    * stat_col (str): Column for test statistic
     * nan_behavior ('omit'/'zero'): How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
                                     omit will remove features (starting from highest nan counts) until no nans remain
                                     zero will replace nans with 0 (only use if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
@@ -527,7 +529,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, n
     print("   Calculating correlation distance matrix", end = ' ... ')
     t0 = time.time()
     # Make the pivot table and rank dataframe
-    pivot = sub_perm_df.pivot(index = 'perm_iter', columns = 'index', values = 'stat')
+    pivot = sub_perm_df.pivot(index = 'perm_iter', columns = 'index', values = stat_col)
     ranks = pivot.rank(axis = 0)
     
     # Make the correlation matrix and dataframe
