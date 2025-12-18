@@ -824,7 +824,7 @@ class GLMCollection():
             
         out = pd.DataFrame({'t-wald': t_wald, 'p-wald': p_wald, 'effect': effect, 'effectSE': effectSE}, index = out_index)
         out[['Celltype', 'Region', 'feature_type']] = out.index.to_series().apply(get_celltype_annot_region_feature_type).apply(pd.Series)
-
+        out.index.name = 'feature'
         return {'df': out, 'c_test': c_test, 'c_ref': c_ref, 'name': name}
         
     def run_stats_with_contrasts(self, contrasts, show_progress = True, n_jobs = None):
@@ -980,6 +980,7 @@ class GLMCollection():
             stats.append(stat)
             indices.append(idx)
         out = pd.DataFrame({'stat': stats}, index = indices)
+        out.index.name = 'feature'
         out[['Celltype', 'Region', 'feature_type']] = out.index.to_series().apply(get_celltype_annot_region_feature_type).apply(pd.Series)
         return out
     
@@ -1193,37 +1194,18 @@ class GLMCollection():
         
         perm_df = self.run_permutations_parallel(contrasts, n_permutations=n_permutations, show_progress=show_progress, n_jobs = n_jobs, n_jobs_inner = n_jobs_inner, **kwargs)
         warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
-        
-        # Function to calculate empirical p-values given a dataframe
-        def calculate_empirical_fdr(df, perm_df, stat_col = 'stat'):
-            
-            # mask out nan values in the stat df and perm df
-            mask = ~df[stat_col].isna()
-            perm_mask = ~perm_df[stat_col].isna()
-            
-            perm_group = perm_df.loc[perm_mask]
-
-            # Check to make sure perm_group has entries
-            if len(perm_group) == 0:
-                df.loc[mask, 'p-nom'] = np.nan      # Empirical p-value using null dist from specific feature
-                return df
-            
-            # Calculate nominal p-value: fraction of null distribution greater or equal to T for the specific feature
-            # +1 corrections are to keep p > 0
-            df.loc[mask, 'p-nom'] = [(np.sum(perm_df[perm_df.index == idx][stat_col] > val)+1) / (len(perm_df[perm_df.index == idx])+1) for idx, val in df.loc[mask, stat_col].items()]
-            return df
 
         # Use permutations as null distribution and apply to dataframe
         for key in stat_res:
             stat_df = stat_res[key]['df']
             
-            stat_df = calculate_empirical_fdr(stat_df.copy(), perm_df[key], stat_col = 't-wald')
+            stat_df = get_empirical_pvalues(stat_df.copy(), perm_df[key], stat_col = 't-wald')
             stat_res[key]['df'] = stat_df
             stat_res[key]['perm_df'] = perm_df[key]
         
         # Calculate permutations from the LLR test for feature-wide significance
         llr_df = self.run_LLR_test()
-        llr_df = calculate_empirical_fdr(llr_df.copy(), perm_df['llr'], stat_col = 'stat')
+        llr_df = get_empirical_pvalues(llr_df.copy(), perm_df['llr'], stat_col = 'stat')
         stat_res['llr'] = {'df': llr_df, 'perm_df': perm_df['llr']}
         return stat_res
 

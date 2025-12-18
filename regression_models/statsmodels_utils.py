@@ -18,12 +18,13 @@ from formulaic_contrasts import FormulaicContrasts
 from joblib import Parallel, delayed, parallel_backend
 from itertools import combinations, product
 import warnings
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 import os
 import re
 import multiprocessing
 import traceback
+from numba_progress import ProgressBar
 from matplotlib.colors import SymLogNorm, Normalize
 from matplotlib import colors, gridspec
 
@@ -444,11 +445,59 @@ def plot_progression_heatmap(
     else:
         plt.close()
 
+def get_empirical_pvalues(df, perm_df, stat_col = 'stat', col_to_add = 'p-nom'):
+    """
+    Fast way to get empirical p-values for multiple features from permutations. Adds the nominal p-values
+    in place and returns the dataframe
+    
+    Parameters:
+    ------------
+    df: pd.DataFrame
+        Dataframe indexed by unique feature name with column for test statistics
+    perm_df: pd.DataFrame
+        Dataframe for each permutation, also indexed by feature with column for test statistics
+    stat_col: str
+        Name of column containing test statistic
+    col_to_add: str
+        Name of column to add containing empirical p-values
+    """
+    
+    mask = ~df[stat_col].isna()
+    perm_mask = (~perm_df[stat_col].isna()) & (perm_df.index.isin(mask[mask].index))
+    
+    sub_perm_df = perm_df[perm_mask]
+    # Sort the feature names and get the index map using np.unique
+    # obs_idx maps obs_feat back to the original order
+    obs_feat, obs_idx = np.unique(mask[mask].index, return_inverse = True)
+    # inv_map maps the original order to the sorted order
+    inv_map = np.empty_like(obs_idx)
+    inv_map[obs_idx] = np.arange(len(obs_idx))
+    
+    # For each permutated feature, get the index of the original feature
+    # in the sorted order
+    perm_idx = np.searchsorted(obs_feat, sub_perm_df.index)
+    
+    # For each permuted feature, get the observed test statistic
+    obs_vals = df.loc[obs_feat, stat_col].values
+    obs_perm_vals = obs_vals[perm_idx]    
+    
+    # Boolean map to see if permuted statistic is greater than the observed
+    geq = sub_perm_df[stat_col].values >= obs_perm_vals
+    
+    # Get the number of times a feature has a greater permuted statistic
+    # by counting the index of features using the geq mask
+    counts = np.bincount(perm_idx, weights = geq)
+    total = np.bincount(perm_idx)
+    # Calculate the p-values (ordered by the sorted features)
+    pvals = (counts + 1) / (total + 1)
+    df.loc[obs_feat, col_to_add] = pvals
+    return df
+
 # Correlation calculations to handle NaN values in permutations
 # Using numba loops is much faster than scipy.spearmanr for each pair of features
 from numba import njit, prange
 @njit(parallel = True)
-def fast_corr(X):
+def fast_corr(X, pbar = None):
     n, m = X.shape
     res = np.empty((m, m), dtype = np.float32)
     
@@ -491,6 +540,9 @@ def fast_corr(X):
                 corr = cov / np.sqrt(var_i * var_j)
             res[i,j] = corr
             res[j,i] = corr
+            
+        if pbar is not None:
+            pbar.update(1)
     return res
 
 # Calculate the simes p-value given a pandas series of p-values
@@ -506,7 +558,7 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', nan_behavior = 'omit'):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', save_corr_df = None):
     """
     Run benjamini bogomolov FDR correction
     
@@ -517,6 +569,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     * alpha: significance threshold
     * plot_threshold: Plot silhouette score vs threshold for clustering
     * stat_col (str): Column for test statistic
+    * save_corr_df (str | None): Save path for the correlation dataframe (optional)
     * nan_behavior ('omit'/'zero'): How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
                                     omit will remove features (starting from highest nan counts) until no nans remain
                                     zero will replace nans with 0 (only use if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
@@ -524,75 +577,114 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     t_start = time.time()
     print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
     # Filter the permutation df to only use features in the llr df
-    sub_perm_df = perm_df[perm_df['index'].isin(llr_df.index)]
+    sub_perm_df = perm_df[perm_df.index.isin(llr_df.index)]
     
-    print("   Calculating correlation distance matrix", end = ' ... ')
+    print("   Calculating correlation distance matrix")
     t0 = time.time()
     # Make the pivot table and rank dataframe
-    pivot = sub_perm_df.pivot(index = 'perm_iter', columns = 'index', values = stat_col)
+    pivot = sub_perm_df.reset_index().pivot(index = 'perm_iter', columns = sub_perm_df.index.name, values = stat_col)
     ranks = pivot.rank(axis = 0)
     
     # Make the correlation matrix and dataframe
-    corr = fast_corr(ranks.to_numpy())
-    corr_df = pd.DataFrame(corr, columns = ranks.columns, index = ranks.columns)
+    # Use numba progress bar to track progress
+    with ProgressBar(total=ranks.shape[1], desc = "Calculating correlation matrix") as progress:
+        corr = fast_corr(ranks.to_numpy(), pbar = progress)
 
-    if nan_behavior == 'zero':
-        corr[np.isnan(corr)] = 0
-        corr_df = corr_df.fillna(0)
-    elif nan_behavior == 'omit':
-        # Find features with highest nan counts
-        counts = defaultdict(int)
-        pair_df = pd.DataFrame()
-        for i in range(corr.shape[0]):
-            for j in range(i+1, corr.shape[0]):
-                if corr[i,j] != corr[j,i]:
-                    counts[corr_df.index[i]] += 1
-                    counts[corr_df.index[j]] += 1
-                    pair_df = pd.concat([pair_df, pd.DataFrame({'feat1': [corr_df.index[i]], 'feat2': [corr_df.index[j]], 'idx1': [i], 'idx2': [j]})], axis = 0)
-        count_df = pd.Series(counts, name = 'nans')
-        count_df = count_df.sort_values(ascending = False)
-        # Remove feats until no nans remain
-        feats_to_remove = []
-        for feat in count_df.index:
-            pair_df = pair_df[(pair_df['feat1'] != feat) & (pair_df['feat2'] != feat)].copy()
-            feats_to_remove.append(feat)
-            if len(pair_df) == 0:
-                break
+    if np.isnan(corr).any():
+        print("Removing features with nans")
+        if nan_behavior == 'zero':
+            corr[np.isnan(corr)] = 0
+            corr_df = pd.DataFrame(corr, columns = ranks.columns, index = ranks.columns)
+            corr_df = corr_df.fillna(0)
+        elif nan_behavior == 'omit':
+            # Find features with highest nan counts
+
+            # Since matrix is symmetric, look for nans above the diagonal
+            upper_mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+            # Get all indices with a nan in the upper diagonal
+            mask = np.isnan(corr) & upper_mask
+            total_nans = len(np.unique(np.concatenate(np.where(mask))))
+            feats_to_remove = []
+            idx_to_remove = []
+            # Remove row/col with the most nans iteratively until none remain
+            while mask.any():
+                # Get the number of times a feature shows in either a row or a column
+                counts = np.bincount(
+                    np.concatenate(np.where(mask))
+                )
+                # Get the row/col with the most nans
+                i = np.argmax(counts)
+                # Keep track of the index and the feature name to remove
+                idx_to_remove.append(i)
+                feats_to_remove.append(ranks.columns[i])
+                #feats_to_remove.append(corr_df.index[i])
+                # Remove the nans in the row
+                mask[i, :] = False
+                mask[:, i] = False
+
+            # Now make the mask for the correlation matrix 
+            mask_to_keep = np.ones(len(corr), bool)
+            mask_to_keep[idx_to_remove] = False
             
-        # Get index map to remove rows/cols from correlation matrix
-        idx_map = {feat: idx for idx, feat in enumerate(corr_df.index)}
-        idx_to_remove = [idx_map[feat] for feat in feats_to_remove]
-        mask = np.ones(len(corr), bool)
-        mask[idx_to_remove] = False
-        
-        corr = corr[mask][:,mask]
-        corr_df = corr_df.loc[corr_df.index.difference(feats_to_remove), corr_df.columns.difference(feats_to_remove)]
-        print(f'\nRemoved the following {len(feats_to_remove)} of {len(counts)} features with NaNs:')
-        print(f'{feats_to_remove}')
+            corr = corr[mask_to_keep][:,mask_to_keep]
+            corr_df = pd.DataFrame(corr, columns = ranks.columns[mask_to_keep], index = ranks.columns[mask_to_keep])
+            #corr_df = corr_df.loc[corr_df.index.difference(feats_to_remove), corr_df.columns.difference(feats_to_remove)]
+            if len(feats_to_remove) > 0:
+                print(f'Removed the following {len(feats_to_remove)} of {total_nans} features with NaNs:')
+                print(f'{feats_to_remove}')
+    else:
+        corr_df = pd.DataFrame(corr, columns = ranks.columns, index = ranks.columns)
+
+    if save_corr_df:
+        corr_df.to_csv(save_corr_df, index_col = 0)
+    print(f"done: {(time.time() - t0) / 60:.2f} min")
+    t0 = time.time()
     # Make distance matrix and calculate linkage
+    print("   Calculating Distance and linkage matrix ... ", end = "")
     dist = 1 - corr
     dist_condensed = squareform(dist)
-    print(f"done: {(time.time() - t0) / 60:.2f} min")
     Z = linkage(dist_condensed, method = 'average') # Unsure if 'average' is proper for this but i guess it works
-    
+    print(f"done: {(time.time() - t0) / 60:.2f} min")
+
     # Calculate best threshold for clustering:
     best_labels = []
     best_score = 0
     best_t = 0
     thresholds = []
     scores = []
-    for t in tqdm(np.linspace(0, 1, 200), desc = "Calculating best clustering threshold"):
-
-        labels = fcluster(Z, t = t, criterion='distance')
+    
+    def get_silhouette_score(Z, t, dist, max_clusters):
+        """
+        Given linkage Z, threshold t, distance matrix dist, and a max number of clusters,
+        return the cluster labels, silhouette score, and threshold
+        """
+        labels = fcluster(Z, t = t, criterion = 'distance')
         n_clusters = len(np.unique(labels))
-        if n_clusters > 1 and n_clusters < len(corr):
-            score = silhouette_score(dist, labels = labels, metric = 'precomputed')
-            thresholds.append(t)
-            scores.append(score)
-            if score > best_score:
-                best_t = t
-                best_score = score
-                best_labels = labels
+        
+        if n_clusters <= 1 or n_clusters >= max_clusters:
+            return None
+        
+        score = silhouette_score(dist, labels = labels, metric = 'precomputed')
+        return (labels, score, t)
+    
+    tasks = [delayed(
+        get_silhouette_score)(
+            Z, t, dist, len(corr)
+        ) for t in np.linspace(0, 1, 100)
+    ]
+    
+    with tqdm_joblib(tqdm(desc = "Calculating silhouette scores", total = len(tasks))) as pbar:
+        results = Parallel(n_jobs = multiprocessing.cpu_count() - 1)(tasks)
+    
+    for res in results:
+        if res is None:
+            continue
+        scores.append(res[1])
+        thresholds.append(res[2])
+        if res[1] > best_score:
+            best_t = res[2]
+            best_score = res[1]
+            best_labels = res[0]
 
     print(f"   Clustering at threshold t = {best_t:.3f}")
     
@@ -735,7 +827,7 @@ def plot_test_stat(perm_df, stat_df, model, stat_col = 'stat', ax = None, bins =
         fig, ax = plt.subplots()
     sns.histplot(
         x = stat_col,
-        data = perm_df[perm_df['index'] == model],
+        data = perm_df[perm_df.index == model],
         stat = 'probability',
         bins = bins,
         label = 'Permutation Tests'
