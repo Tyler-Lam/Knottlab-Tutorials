@@ -119,17 +119,27 @@ def make_dotplot(
     
     Parameters:
     -------------
-    * df: Stats dataframe returned from GLMCollection
-    *
-    * x_col, y_col: dataframe col names to place the row/column for each feature
-    * hue_col: Dataframe column to color each point
-    * pval_col: Dataframe column for pvalue (size + significance)
-    * pval_threshold: Minimum p-value to indicate feature is significant
-    * vmax: Maximum abs(hue_col) for color normalization
-    * xlabel, ylabel: Label for x/y-axis (defaults to x_col/y_col)
-    * cbar_label: Label for the colorbar
-    * test_group, ref_group: Labels for colorbar to indicate enrichment in test vs ref class
-    * title: Title for the plot
+    df: pd.DataFrame
+        Stats dataframe returned from GLMCollection
+    x_col, y_col: str
+        dataframe col names to place the row/column for each feature. Defaults to
+        'annot_region' for x and 'celltype' for y
+    hue_col: str
+        Dataframe column to color each point. Defaults to mu (effect size)
+    pval_col: str
+        Dataframe column for pvalue (size + significance). Defaults to p-wald
+    pval_threshold: str
+        Minimum p-value to indicate feature is significant
+    vmax: float | None
+        Maximum abs(hue_col) for color normalization
+    xlabel, ylabel: str
+        Label for x/y-axis (defaults to x_col/y_col)
+    cbar_label: str
+        Label for the colorbar
+    test_group, ref_group: str
+        Labels for colorbar to indicate enrichment in test vs ref class
+    title: str
+        Title for the plot
     """
     with sns.axes_style('whitegrid'):
         
@@ -243,8 +253,10 @@ def get_progression_df(stat_res, ref_group):
     
     Parameters:
     ------------
-    * stat_res: Output from GLMCollection.run_stats() (or run_stats_with_permutations())
-    * ref_group: Dictionary defining the reference group predictors
+    stat_res: pd.DataFrame
+        Output from GLMCollection.run_stats() (or run_stats_with_permutations())
+    ref_group: dict
+        Dictionary defining the reference group predictors
     """
     res_df = pd.DataFrame()
     
@@ -281,7 +293,8 @@ def plot_progression_heatmap(
     
     Parameters:
     -----------
-    * stat_df: Dataframe obtained from get_progression_df
+    * stat_df: pd.DataFrame
+        Dataframe obtained from get_progression_df
     * llr_df: Dataframe of Log likelihood ratio test results (used to label features using FDR q-value)
     * index: Columns used to index the pivot table
     * columns: Col name to use a columns for the pivot table
@@ -564,7 +577,7 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
 # Run Benjamini Bogomolov selection by clustering based on permutations
 def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', save_corr_df = None, n_jobs = None):
     """
-    Run benjamini bogomolov FDR correction
+    Run benjamini bogomolov FDR correction by clustering features by spearman correlation across permutations
     
     Parameters:
     ------------
@@ -573,7 +586,6 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     * alpha: significance threshold
     * plot_threshold: Plot silhouette score vs threshold for clustering
     * stat_col (str): Column for test statistic
-    * save_corr_df (str | None): Save path for the correlation dataframe (optional)
     * nan_behavior ('omit'/'zero'): How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
                                     omit will remove features (starting from highest nan counts) until no nans remain
                                     zero will replace nans with 0 (only use if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
@@ -592,6 +604,9 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     with ProgressBar(total=ranks.shape[1], desc = "Calculating correlation matrix") as progress:
         corr = fast_corr(ranks.to_numpy(dtype = np.float32), pbar = progress)
     corr = corr.astype(np.float16)
+    
+    # Define the mask of features to keep outside the nan corrections
+    mask_to_keep = np.ones(len(corr), bool)
     
     if np.isnan(corr).any():
         print("Removing features with nans")
@@ -629,7 +644,6 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
             print('   Filtering correlation matrix and dataframe for removed features ... ', end = "")
             t0 = time.time()
             # Now make the mask for the correlation matrix 
-            mask_to_keep = np.ones(len(corr), bool)
             mask_to_keep[idx_to_remove] = False
             
             corr = corr[mask_to_keep][:,mask_to_keep]
@@ -668,7 +682,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         return (labels, score, t)
     
     if n_jobs is None:
-        n_jobs = multiprocessing.cpu_count()
+        n_jobs = multiprocessing.cpu_count() - 1
     if n_jobs > 1:
         tasks = [delayed(
             get_silhouette_score)(
@@ -677,7 +691,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         ]
         
         with tqdm_joblib(tqdm(desc = "Calculating silhouette scores", total = len(tasks))) as pbar:
-            results = Parallel(n_jobs = multiprocessing.cpu_count() - 1 if n_jobs is None else n_jobs)(tasks)
+            results = Parallel(n_jobs = n_jobs)(tasks)
     else:
         results = [
             get_silhouette_score(
@@ -711,7 +725,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Add labels to the LLR df
     clusters_df = pd.merge(llr_df, clusters, left_index = True, right_index = True, how = 'inner')
     # Calculate simes p-value for each group
-    simes_df = clusters_df.groupby('cluster')['p-nom'].apply(get_simes_p)
+    simes_df = clusters_df.groupby('cluster')[pval_col].apply(get_simes_p)
     simes_df = simes_df.rename('p-simes')
     # Add the simes df for future use
     clusters_df = pd.merge(clusters_df, simes_df, left_on = 'cluster', right_index = True, how = 'left')
@@ -719,15 +733,15 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     clusters_df = clusters_df.groupby('cluster').apply(lambda g: apply_fdr(g))
     clusters_df.index = clusters_df.index.get_level_values(1)
     
-    clusters_df['fdr-q-val'] = 1.0
     # Define the final fdr-q-value as the smallest alpha at which a feature would be significant
+    clusters_df['fdr-q-val'] = 1.0
     for a in tqdm(np.linspace(1, 0, 1001), desc = "Calculating final FDR q-values"):
         R = len(simes_df[simes_df < alpha])
         m = len(simes_df)
         a_adj = a * R / m
         signif = (clusters_df['p-simes'] < a) & (clusters_df['cluster-p-adj'] < a_adj)
         clusters_df.loc[signif, 'fdr-q-val'] = a
-    # Signif column if the fdr-q-value is below the preset alpha level
+    # Significant if the fdr-q-value is below the preset alpha level
     clusters_df['signif'] = clusters_df['fdr-q-val'] < alpha
     
     print(f"Done with FDR corrections: {(time.time() - t_start) / 60:.2f} min")
