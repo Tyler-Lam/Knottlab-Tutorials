@@ -293,23 +293,38 @@ def plot_progression_heatmap(
     
     Parameters:
     -----------
-    * stat_df: pd.DataFrame
+    stat_df: pd.DataFrame
         Dataframe obtained from get_progression_df
-    * llr_df: Dataframe of Log likelihood ratio test results (used to label features using FDR q-value)
-    * index: Columns used to index the pivot table
-    * columns: Col name to use a columns for the pivot table
-    * values: Values for the pivot table
-    * signif_col: Column in llr_df to indicate significance. If none, use llr_df[pval_col] <= 0.05
-    * ncols: Number of columns to use for celltype legend. (Values > 1 only really work for niches)
-    * vmax: Maximum value for heatmap normalization
-    * title: Title for the plot
-    * xlabel: Label for the x-axis (defaults to "columns" parameter)
-    * cbar_label: Label for the colorbar
-    * row_cluster: Cluster the rows and plot with a dendrogram. Otherwise order rows based on the index
-    * pval_col: Column name for feature-wise p-value labels on clustermap
-    * cbar_width: width of colorbar
-    * cbar_height: maximum height of colorbar
-    * order: Left to right order for the columns
+    llr_df: pd.DataFrame
+        Dataframe of Log likelihood ratio test results (used to label features using FDR q-value)
+    index: list[str]
+        Columns used to index the pivot table
+    columns: str
+        Col name to use a columns for the pivot table
+    values: str
+        Values for the pivot table
+    signif_col: str
+        Column in llr_df to indicate significance. If none, use llr_df[pval_col] <= 0.05
+    ncols: int
+        Number of columns to use for celltype legend. (Values > 1 only really work for niches)
+    vmax: float
+        Maximum value for heatmap normalization
+    title: str
+        Title for the plot
+    xlabel: str
+        Label for the x-axis (defaults to "columns" parameter)
+    cbar_label: str
+        Label for the colorbar
+    row_cluster: bool
+        Cluster the rows and plot with a dendrogram. Otherwise order rows based on the index
+    pval_col: str
+        Column name for feature-wise p-value labels on clustermap
+    cbar_width: float
+        width of colorbar
+    cbar_height: float
+        maximum height of colorbar
+    order: list[str]
+        Left to right order for the columns
     """
 
     # Make the pivot table for the clustermap
@@ -575,20 +590,29 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', save_corr_df = None, n_jobs = None):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', n_jobs = None):
     """
     Run benjamini bogomolov FDR correction by clustering features by spearman correlation across permutations
     
     Parameters:
     ------------
-    * perm_df: permutation dataframe. Must have a 'feature', 'stat', and 'perm_iter' column
-    * llr_df: Log likelihood-ratio dataframe
-    * alpha: significance threshold
-    * plot_threshold: Plot silhouette score vs threshold for clustering
-    * stat_col (str): Column for test statistic
-    * nan_behavior ('omit'/'zero'): How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
-                                    omit will remove features (starting from highest nan counts) until no nans remain
-                                    zero will replace nans with 0 (only use if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
+    perm_df: pd.DataFrame
+        permutation dataframe. Must have a 'feature', 'stat', and 'perm_iter' column
+    llr_df: pd.DataFRame
+        Log likelihood-ratio dataframe
+    alpha: float
+        significance threshold, defaults to 0.05
+    plot_threshold: bool
+        Plot silhouette score vs threshold for clustering
+    stat_col: str
+        Column for test statistic
+    nan_behavior: 'omit' | 'zero'
+        How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
+            omit will remove features (starting from highest nan counts) until no nans remain
+            zero will replace nans with 0 (only use if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
+    n_jobs: int | None
+        Number of jobs for calculating clustering threshold from silhouette scores.
+        If None, default to ncpus - 1
     """
     t_start = time.time()
     print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
@@ -726,7 +750,8 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     clusters_df = pd.merge(llr_df, clusters, left_index = True, right_index = True, how = 'inner')
     # Calculate simes p-value for each group
     simes_df = clusters_df.groupby('cluster')[pval_col].apply(get_simes_p)
-    simes_df = simes_df.rename('p-simes')
+    simes_df = simes_df.rename('p-simes').to_frame()
+    simes_df['p-simes-adj'] = false_discovery_control(simes_df['p-simes'])
     # Add the simes df for future use
     clusters_df = pd.merge(clusters_df, simes_df, left_on = 'cluster', right_index = True, how = 'left')
     # Apply BH correction within each cluster
@@ -739,7 +764,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         R = len(simes_df[simes_df < alpha])
         m = len(simes_df)
         a_adj = a * R / m
-        signif = (clusters_df['p-simes'] < a) & (clusters_df['cluster-p-adj'] < a_adj)
+        signif = (clusters_df['p-simes-adj'] < a) & (clusters_df['cluster-p-adj'] < a_adj)
         clusters_df.loc[signif, 'fdr-q-val'] = a
     # Significant if the fdr-q-value is below the preset alpha level
     clusters_df['signif'] = clusters_df['fdr-q-val'] < alpha
@@ -753,12 +778,18 @@ def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax =
     
     Parameters:
     -----------
-    * glms (GLMCollection): fitted GLMCollection for all models
-    * pvals (pd.DataFrame): posthoc dataframe (formatted as shown in tutorial notebook)
-    * feature (str): Feature name for comparison
-    * order: Order for x-axis categories
-    * ylabel: Y axis label
-    * title: axis label
+    glms: GLMCollection
+        Fitted GLMCollection for all models
+    pvals: pd.DataFrame
+        posthoc dataframe (formatted as shown in tutorial notebook)
+    feature: str
+        Feature name for comparison
+    order: List[str] | None
+        Order for x-axis categories
+    ylabel: str
+        Y axis label
+    title: str
+        axis label
     """
     
     pvals_df = pvals[pvals['feature'] == feature].copy()
@@ -841,11 +872,16 @@ def plot_test_stat(perm_df, stat_df, model, stat_col = 'stat', ax = None, bins =
     
     Parameters:
     ------------
-    * perm_df: Dataframe containing permutation results for all models
-    * stat_df: Dataframe with observed test statistics
-    * model (str): Name of feature/model to plot
-    * stat_col: Name of test statistic column in dataframes
-    * ax: (optional) matplotlib axis for plotting
+    perm_df: pd.DataFrame
+        Dataframe containing permutation results for all models
+    stat_df: pd.DataFrame
+        Dataframe with observed test statistics
+    model: str
+        Name of feature/model to plot
+    stat_col: str
+        Name of test statistic column in dataframes
+    ax: matplotlib.pyplot.axis | None
+        matplotlib axis for plotting
     """
     if ax is None:
         fig, ax = plt.subplots()
