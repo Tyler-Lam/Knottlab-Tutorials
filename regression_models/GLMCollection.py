@@ -45,7 +45,7 @@ def _fit_single_model(model_name, model, maxiter = 5000, fit_kwargs = {}):
                     if not converged and not np.isnan(result.bse).any():
                         half_converged.append(m)
                         
-            # If no methods fully converged, use the first one with zero nan values
+            # If no methods fully converged, use the first one that half-converged
             if not converged:
                 if len(half_converged) > 0:
                     w.clear()
@@ -259,7 +259,7 @@ class GLMCollection():
         Parameters:
         ------------
         * cols_to_add (List[str]): List of columns to add to model
-        * skip: Dictionary of cell types to skip (see _parse_feature_name)
+        * skip: Dictionary of cell types to skip (see _parse_feature_name method)
         """
         
         # Get the model info for all columns to add
