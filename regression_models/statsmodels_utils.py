@@ -8,7 +8,7 @@ import seaborn as sns
 from tqdm import tqdm
 from scipy import stats
 from scipy.stats import beta, mannwhitneyu
-from scipy.stats import false_discovery_control
+from scipy.stats import false_discovery_control, chi2
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.metrics import silhouette_score
@@ -32,6 +32,7 @@ from statsmodels.base.model import GenericLikelihoodModel, GenericLikelihoodMode
 from statsmodels.othermod.betareg import BetaModel, BetaResults, BetaResultsWrapper
 from statsmodels.discrete.discrete_model import NegativeBinomial, NegativeBinomialResults
 from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP, ZeroInflatedNegativeBinomialResults
+from statsmodels.regression.linear_model import OLS
 
 from statsmodels.genmod.generalized_linear_model import GLMResults
 from scipy.special import betaln
@@ -42,6 +43,10 @@ from scipy.stats import nbinom
 
 from statannotations.Annotator import Annotator
 
+import scanpy as sc
+from pydeseq2.dds import DeseqDataSet
+from pydeseq2.ds import DeseqStats
+import gseapy as gp
             
 # Stackoverflow solution to make tqdm work with joblib.Parallel
 # https://stackoverflow.com/questions/24983493/tracking-progress-of-joblib-parallel-execution/58936697#58936697
@@ -462,6 +467,8 @@ def get_empirical_pvalues(df, perm_df, stat_col = 'stat', col_to_add = 'p-nom'):
         Name of column to add containing empirical p-values
     """
     
+    # Mask out nans in stat dataframe and mask those same features in the permutations
+    # Also mask nans in the permutation dataframe
     mask = ~df[stat_col].isna()
     perm_mask = (~perm_df[stat_col].isna()) & (perm_df.index.isin(mask[mask].index))
     
@@ -469,9 +476,6 @@ def get_empirical_pvalues(df, perm_df, stat_col = 'stat', col_to_add = 'p-nom'):
     # Sort the feature names and get the index map using np.unique
     # obs_idx maps obs_feat back to the original order
     obs_feat, obs_idx = np.unique(mask[mask].index, return_inverse = True)
-    # inv_map maps the original order to the sorted order
-    inv_map = np.empty_like(obs_idx)
-    inv_map[obs_idx] = np.arange(len(obs_idx))
     
     # For each permutated feature, get the index of the original feature
     # in the sorted order
@@ -488,7 +492,7 @@ def get_empirical_pvalues(df, perm_df, stat_col = 'stat', col_to_add = 'p-nom'):
     # by counting the index of features using the geq mask
     counts = np.bincount(perm_idx, weights = geq)
     total = np.bincount(perm_idx)
-    # Calculate the p-values (ordered by the sorted features)
+    # Calculate the p-values (ordered by the sorted features) with a +1 correction for zero values
     pvals = (counts + 1) / (total + 1)
     df.loc[obs_feat, col_to_add] = pvals
     return df
@@ -558,7 +562,7 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', save_corr_df = None):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', save_corr_df = None, n_jobs = None):
     """
     Run benjamini bogomolov FDR correction
     
@@ -579,8 +583,6 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Filter the permutation df to only use features in the llr df
     sub_perm_df = perm_df[perm_df.index.isin(llr_df.index)]
     
-    print("   Calculating correlation distance matrix")
-    t0 = time.time()
     # Make the pivot table and rank dataframe
     pivot = sub_perm_df.reset_index().pivot(index = 'perm_iter', columns = sub_perm_df.index.name, values = stat_col)
     ranks = pivot.rank(axis = 0)
@@ -588,25 +590,28 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Make the correlation matrix and dataframe
     # Use numba progress bar to track progress
     with ProgressBar(total=ranks.shape[1], desc = "Calculating correlation matrix") as progress:
-        corr = fast_corr(ranks.to_numpy(), pbar = progress)
-
+        corr = fast_corr(ranks.to_numpy(dtype = np.float32), pbar = progress)
+    corr = corr.astype(np.float16)
+    
     if np.isnan(corr).any():
         print("Removing features with nans")
         if nan_behavior == 'zero':
             corr[np.isnan(corr)] = 0
-            corr_df = pd.DataFrame(corr, columns = ranks.columns, index = ranks.columns)
-            corr_df = corr_df.fillna(0)
         elif nan_behavior == 'omit':
             # Find features with highest nan counts
-
+            print('   Creating mask for nan values ... ', end = "")
+            t0 = time.time()
             # Since matrix is symmetric, look for nans above the diagonal
             upper_mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
             # Get all indices with a nan in the upper diagonal
             mask = np.isnan(corr) & upper_mask
             total_nans = len(np.unique(np.concatenate(np.where(mask))))
+            print(f'done: {(time.time() - t0) / 60:.2f} min')
             feats_to_remove = []
             idx_to_remove = []
             # Remove row/col with the most nans iteratively until none remain
+            print('   Removing features starting with highest nan counts ... ', end = '')
+            t0 = time.time()
             while mask.any():
                 # Get the number of times a feature shows in either a row or a column
                 counts = np.bincount(
@@ -617,27 +622,22 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
                 # Keep track of the index and the feature name to remove
                 idx_to_remove.append(i)
                 feats_to_remove.append(ranks.columns[i])
-                #feats_to_remove.append(corr_df.index[i])
-                # Remove the nans in the row
+                # Remove the nans in the corresponding row and column
                 mask[i, :] = False
                 mask[:, i] = False
-
+            print(f'done: {(time.time() - t0) / 60:.2f} min')
+            print('   Filtering correlation matrix and dataframe for removed features ... ', end = "")
+            t0 = time.time()
             # Now make the mask for the correlation matrix 
             mask_to_keep = np.ones(len(corr), bool)
             mask_to_keep[idx_to_remove] = False
             
             corr = corr[mask_to_keep][:,mask_to_keep]
-            corr_df = pd.DataFrame(corr, columns = ranks.columns[mask_to_keep], index = ranks.columns[mask_to_keep])
-            #corr_df = corr_df.loc[corr_df.index.difference(feats_to_remove), corr_df.columns.difference(feats_to_remove)]
+            print(f'done: {(time.time() - t0) / 60:.2f} min')
             if len(feats_to_remove) > 0:
                 print(f'Removed the following {len(feats_to_remove)} of {total_nans} features with NaNs:')
                 print(f'{feats_to_remove}')
-    else:
-        corr_df = pd.DataFrame(corr, columns = ranks.columns, index = ranks.columns)
 
-    if save_corr_df:
-        corr_df.to_csv(save_corr_df, index_col = 0)
-    print(f"done: {(time.time() - t0) / 60:.2f} min")
     t0 = time.time()
     # Make distance matrix and calculate linkage
     print("   Calculating Distance and linkage matrix ... ", end = "")
@@ -667,15 +667,24 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         score = silhouette_score(dist, labels = labels, metric = 'precomputed')
         return (labels, score, t)
     
-    tasks = [delayed(
-        get_silhouette_score)(
-            Z, t, dist, len(corr)
-        ) for t in np.linspace(0, 1, 100)
-    ]
-    
-    with tqdm_joblib(tqdm(desc = "Calculating silhouette scores", total = len(tasks))) as pbar:
-        results = Parallel(n_jobs = multiprocessing.cpu_count() - 1)(tasks)
-    
+    if n_jobs is None:
+        n_jobs = multiprocessing.cpu_count()
+    if n_jobs > 1:
+        tasks = [delayed(
+            get_silhouette_score)(
+                Z, t, dist, len(corr)
+            ) for t in np.linspace(0, 1, 100)
+        ]
+        
+        with tqdm_joblib(tqdm(desc = "Calculating silhouette scores", total = len(tasks))) as pbar:
+            results = Parallel(n_jobs = multiprocessing.cpu_count() - 1 if n_jobs is None else n_jobs)(tasks)
+    else:
+        results = [
+            get_silhouette_score(
+                Z, t, dist, len(corr)
+            ) for t in tqdm(np.linspace(0, 1, 100), desc = "Calculating silhouette scores")
+        ]
+        
     for res in results:
         if res is None:
             continue
@@ -698,9 +707,9 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         plt.show()
         
     # Add labels to correlation dataframe
-    corr_df['cluster'] = best_labels
+    clusters = pd.Series(best_labels, index = ranks.columns[mask_to_keep], name = 'cluster')
     # Add labels to the LLR df
-    clusters_df = pd.merge(llr_df, corr_df['cluster'], left_index = True, right_index = True, how = 'inner')
+    clusters_df = pd.merge(llr_df, clusters, left_index = True, right_index = True, how = 'inner')
     # Calculate simes p-value for each group
     simes_df = clusters_df.groupby('cluster')['p-nom'].apply(get_simes_p)
     simes_df = simes_df.rename('p-simes')
@@ -710,16 +719,17 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     clusters_df = clusters_df.groupby('cluster').apply(lambda g: apply_fdr(g))
     clusters_df.index = clusters_df.index.get_level_values(1)
     
-    # Get number of significant groups (R) and total groups (m)
-    R = len(simes_df[simes_df <= alpha])
-    m = len(simes_df)
-    alpha_adj = alpha * R / m # Adjusted feature significance threshold from BB method
+    clusters_df['fdr-q-val'] = 1.0
+    # Define the final fdr-q-value as the smallest alpha at which a feature would be significant
+    for a in tqdm(np.linspace(1, 0, 1001), desc = "Calculating final FDR q-values"):
+        R = len(simes_df[simes_df < alpha])
+        m = len(simes_df)
+        a_adj = a * R / m
+        signif = (clusters_df['p-simes'] < a) & (clusters_df['cluster-p-adj'] < a_adj)
+        clusters_df.loc[signif, 'fdr-q-val'] = a
+    # Signif column if the fdr-q-value is below the preset alpha level
+    clusters_df['signif'] = clusters_df['fdr-q-val'] < alpha
     
-    # Require feature to be in significant cluster and have cluster fdr corrected p-value below adjusted threshold
-    signif = (clusters_df['p-simes'] <= alpha) & (clusters_df['cluster-p-adj'] <= alpha_adj)
-    
-    clusters_df['signif'] = signif
-    clusters_df['fdr-q-val'] = clusters_df['cluster-p-adj'].apply(lambda x: min(x * m / R, 1) if R > 0 else 1)
     print(f"Done with FDR corrections: {(time.time() - t_start) / 60:.2f} min")
     return clusters_df
 
