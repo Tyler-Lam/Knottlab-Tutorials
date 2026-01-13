@@ -1,20 +1,15 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib.colors import SymLogNorm, Normalize
+from matplotlib import colors, gridspec
 import numpy as np
 import math
 import time
 import seaborn as sns
 from tqdm import tqdm
-from scipy import stats
-from scipy.stats import beta, mannwhitneyu
-from scipy.stats import false_discovery_control, chi2
-from scipy.spatial.distance import squareform
-from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.metrics import silhouette_score
-from patsy import dmatrices
-import statsmodels.api as sm
-from formulaic_contrasts import FormulaicContrasts
+import contextlib
+import joblib
 from joblib import Parallel, delayed, parallel_backend
 from itertools import combinations, product
 import warnings
@@ -25,21 +20,25 @@ import re
 import multiprocessing
 import traceback
 from numba_progress import ProgressBar
-from matplotlib.colors import SymLogNorm, Normalize
-from matplotlib import colors, gridspec
 
+from scipy import stats
+from scipy.stats import beta, mannwhitneyu, false_discovery_control, chi2, lognorm, nbinom
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.special import betaln, gammaln
+from scipy.optimize import minimize_scalar
+from sklearn.metrics import silhouette_score
+
+from patsy import dmatrices
+from formulaic_contrasts import FormulaicContrasts
+
+import statsmodels.api as sm
 from statsmodels.base.model import GenericLikelihoodModel, GenericLikelihoodModelResults
 from statsmodels.othermod.betareg import BetaModel, BetaResults, BetaResultsWrapper
 from statsmodels.discrete.discrete_model import NegativeBinomial, NegativeBinomialResults
 from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP, ZeroInflatedNegativeBinomialResults
 from statsmodels.regression.linear_model import OLS
-
 from statsmodels.genmod.generalized_linear_model import GLMResults
-from scipy.special import betaln
-from scipy.special import gammaln
-from scipy.stats import lognorm
-from scipy.optimize import minimize_scalar
-from scipy.stats import nbinom
 
 from statannotations.Annotator import Annotator
 
@@ -50,8 +49,6 @@ import gseapy as gp
             
 # Stackoverflow solution to make tqdm work with joblib.Parallel
 # https://stackoverflow.com/questions/24983493/tracking-progress-of-joblib-parallel-execution/58936697#58936697
-import contextlib
-import joblib
 @contextlib.contextmanager
 def tqdm_joblib(tqdm_object):
     """Context manager to patch joblib to report into tqdm progress bar given as argument"""
@@ -862,6 +859,56 @@ def plot_posthoc(glms, pvals, feature, order = None, ylabel = 'Proportion', ax =
     ax.grid()
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    ax.tick_params(axis = 'x', labelrotation = 45)
+    return ax
+
+def plot_posthoc_gene_analyzer(analyzer, pvals, feature, order = None, ylabel = 'Proportion', ax = None, title = "", hide_non_significant = True):
+    """
+    Plot the posthoc comparisons for the gene analyzer using means of the fits and pairwise comparisons
+    
+    Parameters:
+    -----------
+    analyzer: GeneAnalyzer
+        Fitted GeneAnalyzer for all models
+    pvals: pd.DataFrame
+        posthoc dataframe (formatted as shown in tutorial notebook)
+    feature: str
+        Feature name for comparison
+    order: List[str] | None
+        Order for x-axis categories
+    ylabel: str
+        Y axis label
+    title: str
+        axis label
+    """
+    
+    # Get the data for the given feature and get variables for the annotator
+    data = analyzer.get_feature_dataframe(feature)
+    pvals_df = pvals[pvals['feature'] == feature].copy()
+    pairs = [[g1, g2] for g1, g2 in zip(pvals_df['group1'].values, pvals_df['group2'].values)]
+    ps = pvals_df['fdr-q-val'].values
+    # If given a fixed order, make sure that classifications are present in the model
+    if order is not None:
+        if len(set(order).intersection(set(data['classification'].unique()))) == 0:
+            print(f"Given order has no values in the model's classification categories.\nPossible values are: {', '.join(data['classification'].unique())}")
+    if ax is None:
+        _, ax = plt.subplots()
+        
+    # Plot the feature
+    analyzer.plot_feature(feature, order = order, ax = ax)
+    
+    # Add missing columns
+    # This is necessary for the annotation formatting to account for empty columns
+    missing = set(order).difference(set(data['classification'].unique()))
+    for m in missing:
+        data = pd.concat([data, pd.DataFrame({'rate': [np.nan], 'classification': [m]})], axis = 0, join = 'outer')
+    annot = Annotator(ax, pairs, data = data, x = 'classification', y = feature.split('___')[0], order = order)
+    if sum(ps < 0.05) == 0: # If no significant p-values, show all values
+        hide_non_significant = False
+    annot.configure(test = None, text_format = 'full', show_test_name = False, verbose = 0, hide_non_significant = hide_non_significant)
+    annot.set_pvalues(ps)
+    annot.annotate()
+
     ax.tick_params(axis = 'x', labelrotation = 45)
     return ax
 
