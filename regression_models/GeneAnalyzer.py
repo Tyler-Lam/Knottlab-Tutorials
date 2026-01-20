@@ -14,7 +14,8 @@ class GeneAnalyzer():
         skip = defaultdict(list),
         design = None,
         design_null = None,
-        gene_set = None
+        gene_set = None,
+        layer = None
     ):
         """
         Class to do Deseq2 and GSVA analysis
@@ -57,6 +58,8 @@ class GeneAnalyzer():
         gene_set: str | None (optional)
             Path to gene set .txt file to create the gene_dict. If none, use the MSigDB_hallmark_2020
             pathway set compiled by Rick
+        layer: str | None
+            If not None, key for counts layer to aggregate data. If None, use anndata.X
         """
         
         self.adata = adata.copy()
@@ -68,9 +71,11 @@ class GeneAnalyzer():
         self.metadata = metadata
         self.meta_merge_key = meta_merge_key
         self.is_grouped = is_grouped
+        self.layer = layer
         
         if metadata is not None:
-            self.metadata = self.metadata[~self.metadata[self.pseudobulk_key + self.comparisons].isna().any(axis = 1)]
+            cols = list(set(self.metadata.columns).intersection(set(self.pseudobulk_key + self.comparisons)))
+            self.metadata = self.metadata[~self.metadata[cols].isna().any(axis = 1)]
             self.metadata = self.metadata[self.metadata[meta_merge_key].isin(self.adata.obs[meta_merge_key].unique())]
             if len(preselection) > 0:
                 self.metadata = self.metadata[self.metadata.eval(' & '.join(f'({x})' for x in self.preselection))]
@@ -115,7 +120,7 @@ class GeneAnalyzer():
         contrast = None,
         dds_kwargs = {}, 
         ds_kwargs = {},
-        show_progress = True
+        show_progress = True,
     ):
         """
         Run deseq2 analysis, store results in analyzer
@@ -142,6 +147,8 @@ class GeneAnalyzer():
             kwargs for DeseqDataSet. Arguments shared with other kwargs will be overwritten
         ds_kwargs: dict
             kwargs for DeseqStats. Arguments shared with other kwargs will be overwritten
+        layer: str | None
+            Name of layer containing counts. If none, uses adata.X
         """
         
         # If a contrast is provided, pass it into the kwargs and use the wald test
@@ -164,7 +171,7 @@ class GeneAnalyzer():
         if not self.is_grouped:
             if show_progress:
                 print("Pseudobulking anndata ... ", end = "")
-            adata_agg = sc.get.aggregate(self.adata, by = self.pseudobulk_key + self.group_key + self.comparisons, func = 'sum', layer = 'counts')
+            adata_agg = sc.get.aggregate(self.adata, by = self.pseudobulk_key + self.group_key + self.comparisons, func = 'sum', layer = self.layer)
             self.adata = adata_agg
             self.is_grouped = True
             if show_progress:
@@ -372,7 +379,7 @@ class GeneAnalyzer():
         ds_kwargs = {},
         gsva_kwargs = {},
         fit_kwargs = {},
-        show_progress = True
+        show_progress = True,
     ):
         """
         Run full analysis pipeline
