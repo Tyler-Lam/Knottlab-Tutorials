@@ -1,6 +1,6 @@
 # Regression Model Analysis Pipeline
 
-Last updated 11/7/25 - Tyler Lam
+Last updated 1/13/26 - Tyler Lam
 
 Scripts used to compare features using various regression models. These models take feature dataframes and construct GLMs/regression models to extract p-values using contrast vectors.
 
@@ -28,6 +28,11 @@ Caveat: Most of these aren't actually GLMs but since they were used in the origi
 
 4. `tutorial_feature_comparison.ipynb` - Tutorial notebook outlining the main functions of the GLMCollection and helper scripts
 
+5. `GeneAnalyzer.py` - Class that handles differential expression and pathway enrichment analyses
+
+6. `tutorial_gene_analysis.ipynb` - Tutorial notebook for GeneAnalyzer
+
+
 ### Modifications for other analyses
 
 Most other analyses will use similar features calculated on different datasets. If the goal is to find significant differences (not to find predictors for different conditions), the code can be run with minimal modifications. The following list is mainly clerical/syntax changes
@@ -40,3 +45,20 @@ Most other analyses will use similar features calculated on different datasets. 
    * This function is used by the GLM collection to get the cell type, region, columns used for the regression models, and model type
    * If your feature names differ from mine, this will have to be changed
    * If you want to use a different model (e.g. gamma instead of negative binomial) you would change the `model_type` here to match the conventions in [`add_models_batch`](https://github.com/Tyler-Lam/Knottlab-Tutorials/blob/50f584f70403b7678448421de84a09e25525a0ce/regression_models/GLMCollection.py#L293)
+
+### Setup environment for GeneAnalyzer
+
+I use a modified version of PyDESeq2 that has an implementation of the likelihood ratio test. This is not present in the original PyDESeq2 code as of the time of making this code. My modified version can be found [here](https://github.com/Tyler-Lam/PyDESeq2) and is based on PyDESeq version 0.5.3
+
+You can install this using github into a compatible conda environment using the following
+```
+$ git clone https://github.com/Tyler-Lam/PyDESeq2.git
+$ cd PyDESeq2
+$ conda activate myenv
+$ pip install -e .
+```
+
+Alternatively (for my coworkers), you can copy my environment from `/common/lamt2/miniforge3/envs/pydeseq2_dev` and do
+```
+$ pip install -e /common/lamt2/src/PyDESeq2/
+```
