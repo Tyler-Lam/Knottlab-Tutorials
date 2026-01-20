@@ -115,29 +115,44 @@ def _run_single_comparison(res, c_test, c_ref, name):
     
     
 class GLMCollection():
-    def __init__(self, features, preselection, group_key, comparisons, formula = None, null_formula = None, agg_features = None):
+    def __init__(
+        self,
+        features,
+        preselection,
+        group_key,
+        comparisons,
+        formula = None,
+        null_formula = None,
+        agg_features = None):
         """
         Class to store beta-binomial and gamma-poisson GLMs and perform fits/permutation testing
         
         Parameters:
         -----------
-        * features: dataframe indexed by patient/core/sample with features and metadata as columns. See tutorial for formatting
-        * preselection (Dict): Dictionary of col: value pairs. Filter rows that do not meet this criteria
-        * group_key (List[str]): Key for pseudo-bulk. Must have length > 0
-        * comparison (List[str]): List of comparisons (predictors) for regression
+        features: pd.DataFrame
+            dataframe indexed by patient/core/sample with features and metadata as columns. See tutorial for formatting
+        preselection: dict | str | List[str]
+            Filtering criteria for patients
+            If dictionary, key: val pairs will be filtered with df[key] == val
+            If str or list[str], use pd.eval() to filter by all equations
+        group_key: str | List[str]
+            Metadata columns that define groups for aggregating features. Generally by patient
+        comparisons: str | List[str]
+            Column(s) to specify covariate(s) in the design matrix
         """
         
         self.features_raw = features
-        self.preselection = preselection
+        self.preselection = [preselection] if isinstance(preselection, str) else preselection
         self.group_key = group_key if isinstance(group_key, list) else [group_key]
         self.comparisons = comparisons if isinstance(group_key, list) else [comparisons]
 
-        # Filter based on preselection and nan-values in predictors
-        for col, val in self.preselection.items():
-            self.features_raw = self.features_raw[self.features_raw[col] == val].copy()
-        for comp in comparisons:
-            self.features_raw = self.features_raw[~self.features_raw[comp].isna()].copy()
-        
+        if isinstance(self.preselection, dict):    
+            # Filter based on preselection and nan-values in predictors
+            self.features_raw = self.features_raw[(self.features_raw[list(self.preselection.keys())] == pd.Series(self.preselection)).all(axis = 1)].copy()
+        elif isinstance(self.preselection, list):
+            self.features_raw = self.features_raw[self.features_raw.eval(' & '.join(f'({x})' for x in self.preselection))].copy()
+        self.features_raw = self.features_raw[~self.features_raw[self.group_key + self.comparisons].isna().any(axis = 1)]
+
         # Aggregated feature dataframe
         self.agg_features = agg_features
 
@@ -165,8 +180,10 @@ class GLMCollection():
         
         Parameters:
         --------------
-        * c (str): Column name for feature
-        * skip: Dictionary of celltypes per category to skip due to low statistics or redundancy (eg {'primary_celltype': ['neural', 'muscle']} to skip comparisons using neural/muscle as primary_celltypes)
+        c: str
+            Column name for feature
+        skip: dict
+            Dictionary of celltypes per category to skip due to low statistics or redundancy (eg {'primary_celltype': ['neural', 'muscle']} to skip comparisons using neural/muscle as primary_celltypes)
         """
         
         info = {'val_col': c}
@@ -683,7 +700,7 @@ class GLMCollection():
                 x_pos = {cat: i for i, cat in enumerate(order)}
         
         # Get uniform binning for all histograms
-        content, bins = np.histogram(self.features[model]['rate'], bins = 'auto')
+        content, bins = np.histogram(self.features[model]['rate'], bins = 'auto', density = True)
         x = np.linspace(bins[0], bins[-1], 1000)
         if log:
             bins = np.logspace(np.log10(bins[0] if bins[0] > 0 else self.features[model]['rate'].min()), np.log10(bins[-1]), 10)
@@ -767,7 +784,7 @@ class GLMCollection():
         else:
             return ax
     
-    def plot_model(self, model, fitted = False, order = None, logx = False, logy = False, cbar_label = '', ax_label = '', figsize = (8, 10), show = True, save_dir = None):
+    def plot_model(self, model, fitted = False, order = None, logx = False, logy = False, cbar_label = '', ax_label = '', title = '', figsize = (8, 10), show = True, save_dir = None):
         """
         Plot the distribution of data for a given model. Top plot is a normalized histogram for each feature category (unstacked). Bottom plot is a strip + violin plot with points colored by the denominator (total_counts or scale)
         
@@ -784,7 +801,7 @@ class GLMCollection():
         fig, ax = plt.subplots(2, 1, figsize = figsize, constrained_layout = True)
         self.hist_plot(model, fitted = fitted, order = order, logx = logx, logy = logy, ax_label = ax_label, show = False, ax = ax[0])
         self.strip_plot(model, fitted = fitted, order = order, log = logy, cbar_label=cbar_label, ax_label=ax_label, show = False, ax = ax[1])
-    
+        fig.suptitle(title)
         if show:
             plt.show()
         else:
@@ -864,12 +881,9 @@ class GLMCollection():
             # If there are no "other" predictors, then loop over all pairs and make the dataframe
             if len(others) == 0:
                 for pair in pairs:
-                    res = {}
                     name = f'{comp}__{pair[0]}_vs_{pair[1]}'
                     cont_test = {comp: pair[0]}
                     cont_ref = {comp: pair[1]}
-
-                    name = "___".join([name, f'{"___".join([f"{key}__{val}" for key, val in self.preselection.items()])}'])
 
                     contrasts.append({'name': name, 'test': cont_test, 'ref': cont_ref})
                     metadata[name]['comparison'] = comp
@@ -877,13 +891,12 @@ class GLMCollection():
                     metadata[name]['test_group'] = cont_test
                     metadata[name]['ref_group'] = cont_ref
                     # Dictionary of control variables
-                    metadata[name]['control'] = {key: val for key, val in self.preselection.items()}
+                    metadata[name]['control'] = self.preselection
                     
             # If there are other predictors, loop over all combinations and run pairwise comparisons for each
             else:
                 for idx, row in self.features_raw[others].drop_duplicates().dropna().iterrows():
                     for pair in pairs:
-                        res = {}
                         name = f'{comp}__{pair[0]}_vs_{pair[1]}'
                         cont_test = {comp: pair[0]}
                         cont_ref = {comp: pair[1]}
@@ -893,8 +906,7 @@ class GLMCollection():
                             cont_test[c] = row[c]
                             cont_ref[c] = row[c]
                             name += f'___{c}__{row[c]}'
-                        name = "___".join([name, f'{"___".join([f"{key}__{val}" for key, val in self.preselection.items()])}'])
-
+                        
                         contrasts.append({'name': name, 'test': cont_test, 'ref': cont_ref})
                         metadata[name] = {}
                         metadata[name]['comparison'] = comp
@@ -902,8 +914,11 @@ class GLMCollection():
                         metadata[name]['test_group'] = cont_test
                         metadata[name]['ref_group'] = cont_ref
                         # Dictionary of control variables
-                        metadata[name]['control'] = {c: row[c] for c in others}
-                        metadata[name]['control'].update({key: val for key, val in self.preselection.items()})
+                        metadata[name]['control'] = self.preselection
+                        if isinstance(self.preselection, dict):
+                            metadata[name]['control'].update({c: row[c] for c in others})
+                        elif isinstance(self.preselection, list):
+                            metadata[name]['control'].extend([f'{c} == {row[c]}' for c in others])
         stat_res = self.run_stats_with_contrasts(contrasts, **kwargs)
         for key in stat_res:
             stat_res[key].update(metadata[key])
@@ -971,15 +986,18 @@ class GLMCollection():
 
         stats = []
         indices = []
+        dfs = []
         for idx in self.results:
             if not self.converged[idx] or not self.converged_null[idx]:
                 continue
             lr_full = self.results[idx].llf
             lr_null = self.results_null[idx].llf
+            df = self.results[idx].df_model - self.results_null[idx].df_model
             stat = max(0, 2 * (lr_full - lr_null)) # Sometimes the LLR is negative due to numerical approximations
             stats.append(stat)
             indices.append(idx)
-        out = pd.DataFrame({'stat': stats}, index = indices)
+            dfs.append(df)
+        out = pd.DataFrame({'stat': stats, 'df': dfs}, index = indices)
         out.index.name = 'feature'
         out[['Celltype', 'Region', 'feature_type']] = out.index.to_series().apply(get_celltype_annot_region_feature_type).apply(pd.Series)
         return out
@@ -1000,6 +1018,8 @@ class GLMCollection():
             perm_cols = self.group_key + self.comparisons
         elif not isinstance(perm_cols, list):
             perm_cols = [perm_cols]
+        if not set(self.group_key).issubset(set(perm_cols)):
+            perm_cols = list(set(perm_cols + self.group_key))
         shuffled_df = df[perm_cols].drop_duplicates()
         shuffled_df['tmp_idx'] = shuffled_df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
         
@@ -1047,7 +1067,7 @@ class GLMCollection():
                 df = self._shuffle_agg_df(df, random_state = random_state)
             else:
                 df = df.groupby(group_cols, group_keys = False).apply(lambda g: self._shuffle_agg_df(g, perm_cols = perm_cols, random_state = random_state), include_groups = True)
-            
+
             try:
                 # Make a new dataframe with the shuffled features, including the aggregated features to skip the groupby function
                 glms = GLMCollection(df, {}, self.group_key, self.comparisons, formula = self.formula, null_formula = self.null_formula, agg_features=df.set_index(self.group_key + self.comparisons))
@@ -1061,7 +1081,7 @@ class GLMCollection():
                 for idx in stat_res.keys():
                     out_res[idx] = stat_res[idx]['df']
                     # Keep only important columns from the stat df
-                    out_res[idx] = out_res[idx][[c for c in out_res[idx].columns if c.startswith('t-') or c in ['Celltype', 'Region', 'feature_type']]]
+                    out_res[idx] = out_res[idx][[c for c in out_res[idx].columns if c.startswith('t-') or c in ['Celltype', 'Region', 'feature_type', 'df']]]
                 # Run the pseudo-anova log-likelihood test
                 out_res['llr'] = glms.run_LLR_test()
             
