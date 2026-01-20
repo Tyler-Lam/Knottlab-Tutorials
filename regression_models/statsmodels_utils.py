@@ -605,8 +605,8 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         Column for test statistic
     nan_behavior: 'omit' | 'zero'
         How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
-            omit will remove features (starting from highest nan counts) until no nans remain
-            zero will replace nans with 0 (only use if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
+        "omit" removes features (starting from highest nan counts) until no nans remain
+        "zero" replaces nans with 0. This is much faster, but should only be used if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
     n_jobs: int | None
         Number of jobs for calculating clustering threshold from silhouette scores.
         If None, default to ncpus - 1
@@ -624,6 +624,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Use numba progress bar to track progress
     with ProgressBar(total=ranks.shape[1], desc = "Calculating correlation matrix") as progress:
         corr = fast_corr(ranks.to_numpy(dtype = np.float32), pbar = progress)
+    # Downcast to float16 for memeory since these matrices can be large
     corr = corr.astype(np.float16)
     
     # Define the mask of features to keep outside the nan corrections
