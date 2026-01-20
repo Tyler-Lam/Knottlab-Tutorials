@@ -177,7 +177,7 @@ class GeneAnalyzer():
             if show_progress:
                 print(f"done: {(time.time() - t0)/60:.2f} min")
         
-        for idx, row in (pbar := tqdm(self.adata.obs[self.group_key].drop_duplicates().iterrows(), total = len(self.adata.obs[self.group_key].drop_duplicates()), disable = not show_progress)):
+        for _, row in (pbar := tqdm(self.adata.obs[self.group_key].drop_duplicates().iterrows(), total = len(self.adata.obs[self.group_key].drop_duplicates()), disable = not show_progress)):
             key = tuple([str(row[g]) for g in self.group_key])
             pbar.set_description(f"Running PyDeseq2 for {key}")
             
@@ -427,7 +427,7 @@ class GeneAnalyzer():
         perm_cols = self.pseudobulk_key + self.comparisons
         shuffled_meta = meta[perm_cols].drop_duplicates()
         shuffled_meta['tmp_idx'] = shuffled_meta.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
-        shuffled_meta = shuffled_meta.sort_values['tmp_idx']
+        shuffled_meta = shuffled_meta.sort_values('tmp_idx')
         
         rng = np.random.default_rng(random_state)
         shuffle_dict = dict(zip(shuffled_meta['tmp_idx'], rng.permutation(shuffled_meta['tmp_idx'])))
