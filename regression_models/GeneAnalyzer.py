@@ -427,6 +427,7 @@ class GeneAnalyzer():
         perm_cols = self.pseudobulk_key + self.comparisons
         shuffled_meta = meta[perm_cols].drop_duplicates()
         shuffled_meta['tmp_idx'] = shuffled_meta.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
+        shuffled_meta = shuffled_meta.sort_values['tmp_idx']
         
         rng = np.random.default_rng(random_state)
         shuffle_dict = dict(zip(shuffled_meta['tmp_idx'], rng.permutation(shuffled_meta['tmp_idx'])))
