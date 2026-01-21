@@ -80,9 +80,12 @@ def _run_single_comparison(res, c_test, c_ref, name):
     
     Parameters:
     -----------
-    * res: Model fit result
-    * c_test, c_ref (pd.Series): Test and reference contrast vectors from GLMCollection.cond()
-    * name (str): Model name
+    res: statsmodels fit results object
+        Fit result to get comparisons from
+    c_test, c_ref: pd.Series
+        Contrast vector for test and reference classes. Formatted automatically by GLMCollection.cond()
+    name: str
+        Model name. Used to index the stat dataframe
     
     Returns a tuple of (t-wald, p-wald, effect, effectSE, name)
     """
@@ -123,7 +126,8 @@ class GLMCollection():
         comparisons,
         formula = None,
         null_formula = None,
-        agg_features = None):
+        agg_features = None
+    ):
         """
         Class to store beta-binomial and gamma-poisson GLMs and perform fits/permutation testing
         
@@ -139,6 +143,12 @@ class GLMCollection():
             Metadata columns that define groups for aggregating features. Generally by patient
         comparisons: str | List[str]
             Column(s) to specify covariate(s) in the design matrix
+        formula: str | None
+            Formulaic formula for the full model design matrix. If None, default to all comparisons + interactions
+        null_formula: str | None
+            Formulaic formula for the null model design matrix. If None, default to ~1 (constant design matrix)
+        agg_features: pd.Dataframe | None
+            Aggregated feature dataframe. If None, aggregate features when adding all models
         """
         
         self.features_raw = features
@@ -269,14 +279,22 @@ class GLMCollection():
             print("Column does not match format for proportions, densities, or spatial correlations")
             return None
         
-    def add_models_batch(self, cols_to_add, skip = defaultdict(list), verbose = True, show_progress = True):
+    def add_models_batch(
+        self,
+        cols_to_add,
+        skip = defaultdict(list),
+        verbose = True,
+        show_progress = True
+    ):
         """
         Add all models to the GLMCollection. From Aagam's modifications
         
         Parameters:
         ------------
-        * cols_to_add (List[str]): List of columns to add to model
-        * skip: Dictionary of cell types to skip (see _parse_feature_name method)
+        cols_to_add: (List[str])
+            List of columns to add to model
+        skip: dict[list]
+            Dictionary of cell types to skip (see _parse_feature_name method)
         """
         
         # Get the model info for all columns to add
@@ -439,7 +457,7 @@ class GLMCollection():
                     alpha_MOM = (var - mu) / (mu**2) #since var = mu + alpha * mu^2
                     pct_zero_exp = (1 / (1 + alpha_MOM * mu))**(1/alpha_MOM)
                     pct_zero = sum(agg_df['counts'] == 0) / len(agg_df['counts'])
-                    if (pct_zero > 1.5 * pct_zero_exp and pct_zero > pct_zero_exp + 0.05) or pct_zero > 0.1:
+                    if (pct_zero > 1.5 * pct_zero_exp and pct_zero > pct_zero_exp + 0.05):# or pct_zero > 0.1:
                         self.models[val_col] = ZeroInflatedNegativeBinomialCustom(y, X, offset = offset)
                         self.models_null[val_col] = ZeroInflatedNegativeBinomialCustom(y, null_X, offset = offset)
                     else:
@@ -453,13 +471,26 @@ class GLMCollection():
             for idx, warning in warning_list:
                 print(f'   Warning adding {idx}: {warning}')
 
-    def fit_models_parallel(self, n_jobs = None, verbose = True, show_progress = True, fit_kwargs = {}):
+    def fit_models_parallel(
+        self,
+        n_jobs = None,
+        verbose = True,
+        show_progress = True,
+        fit_kwargs = {}
+    ):
         """
         Fit all models in parallel
         
         Parameters:
         -----------
-        
+        n_jobs: int | None
+            Number of jobs for fitting parallelization. If None, default to multiprocessing.cpu_count() - 1
+        verbose: bool
+            Print updates during model adding and fitting
+        show_progress: bool
+            Show tqdm progress bars
+        fit_kwargs: dict
+            Keyword arguments for fitting
         """
         if n_jobs is None:
             n_jobs = multiprocessing.cpu_count() - 1
@@ -490,7 +521,13 @@ class GLMCollection():
                 print(f'   warning when fitting {idx}: {warning}')
         self.isfit = True
 
-    def fit_null_models_parallel(self, n_jobs = None, verbose = True, show_progress = True, fit_kwargs = {}):
+    def fit_null_models_parallel(
+        self,
+        n_jobs = None,
+        verbose = True,
+        show_progress = True,
+        fit_kwargs = {}
+    ):
         
         if n_jobs is None:
             n_jobs = multiprocessing.cpu_count() - 1
@@ -544,7 +581,8 @@ class GLMCollection():
         
         Parameters:
         ------------
-        kwargs: parameter = values must are predictors and categories to get the contrast for specific data classes
+        kwargs:
+            parameter: value pairs must be predictors and categories to get the contrast for specific data classes
         
         Example: My design matrix used the formula "counts + total_counts ~ HR_HPV + P53 + HR_HPV:P53
         To get the contrast comparing P53+ HPV- (test) with P53- HPV- (ref), I would do:
@@ -591,18 +629,37 @@ class GLMCollection():
                 pass
         return contrast
 
-    def hist_plot(self, model, fitted = False, order = None, logx = False, logy = False, ax_label = '', figsize = (8, 5), show = False, ax = None, title = ''):
+    def hist_plot(
+        self,
+        model,
+        fitted = False,
+        order = None,
+        logx = False,
+        logy = False,
+        ax_label = '', 
+        figsize = (8, 5), 
+        show = False,
+        ax = None,
+        title = ''
+    ):
         """
         Plot a histogram of the distribution of data for a given model. Top plot is a normalized histogram for each feature category (unstacked). Bottom plot is a strip + violin plot with points colored by the denominator (total_counts or scale)
         
         Parameters:
         ------------
-        * model (str): Model name to plot
-        * fitted: Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
-        * order: Order (and subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
-                 If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
-        * logy: Use a log scale for the y-axis
-        * ax_label: Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
+        model: str
+            Model name to plot
+        fitted: bool
+            Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
+        order: list[str] | None
+            Order (and/or subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
+            If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
+        logy: bool
+            Use a log scale for the y-axis
+        ax_label: str | None
+            Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
+        ax: matplotlib.pyplot.axis | None
+            axis object for plotting
         """
         if fitted:
             if model not in self.results.keys() or not self.converged[model]:
@@ -672,19 +729,37 @@ class GLMCollection():
         else:
             return ax
 
-    def strip_plot(self, model, fitted = False, order = None, log = False, cbar_label = '', ax_label = '', figsize = (8, 5), show = False, save_dir = None, ax = None, title = ''):
+    def strip_plot(
+        self,
+        model,
+        fitted = False,
+        order = None,
+        log = False,
+        cbar_label = '', 
+        ax_label = '', 
+        figsize = (8, 5),
+        show = False,
+        ax = None,
+        title = ''
+    ):
         """
         Plot a strip plot and envelope of the distribution of data for a given model. Top plot is a normalized histogram for each feature category (unstacked). Bottom plot is a strip + violin plot with points colored by the denominator (total_counts or scale)
         
         Parameters:
         ------------
-        * model (str): Model name to plot
-        * fitted: Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
-        * order: Order (and subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
-                 If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
-        * logy: Use a log scale for the y-axis
-        * cbar_label: Label for the colorbar. This always uses the denominator when calculating the feature, so for proportions the label should be "Total cells", densities should be "Area", etc.
-        * ax_label: Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
+        model: str
+            Model to plot
+        fitted: bool    
+            Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
+        order: list[str] | None
+            Order (and subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
+            If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
+        logy: bool   
+            Use a log scale for the y-axis
+        cbar_label: str | None
+            Label for the colorbar. This always uses the denominator when calculating the feature, so for proportions the label should be "Total cells", densities should be "Area", etc.
+        ax_label: str | None
+            Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
         """
         if fitted:
             if model not in self.results.keys() or not self.converged[model]:
@@ -784,24 +859,49 @@ class GLMCollection():
         else:
             return ax
     
-    def plot_model(self, model, fitted = False, order = None, logx = False, logy = False, cbar_label = '', ax_label = '', title = '', figsize = (8, 10), show = True, save_dir = None):
+    def plot_model(
+        self,
+        model,
+        fitted = False,
+        order = None,
+        logx = False,
+        logy = False,
+        cbar_label = '', 
+        ax_label = '',
+        title = '',
+        figsize = (8, 10),
+        show = True,
+        save_dir = None
+    ):
         """
         Plot the distribution of data for a given model. Top plot is a normalized histogram for each feature category (unstacked). Bottom plot is a strip + violin plot with points colored by the denominator (total_counts or scale)
         
         Parameters:
         ------------
-        * model (str): Model name to plot
-        * fitted: Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
-        * order: Order (and subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
-                 If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
-        * logy: Use a log scale for the y-axis
-        * cbar_label: Label for the colorbar. This always uses the denominator when calculating the feature, so for proportions the label should be "Total cells", densities should be "Area", etc.
-        * ax_label: Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
+        model: str
+            Model to plot
+        fitted: bool
+            Plot the fitted model. We interpret the beta-binomial and gamma-poisson as mixed models on the means, and use the underlying beta or gamma distributions as the pdf. These are overlaid on the histograms and used as the envelope for the violin plots
+        order: list[str] | None
+            Order (and/or subset) of classifications to plot. These must be formatted the same way as the feature "classification" column made when getting the aggregated features
+            If I am comparing HR_HPV and Diagnosis stage but only want LSIL and HSIL for HPV+ in a specific order, I would use order = ['HR_HPV__1.0___Diagnosis__No_SIL', 'HR_HPV__1.0___Diagnosis__LSIL']
+        logy: bool
+            Use a log scale for the y-axis. Default = False
+        cbar_label: str | None
+            Label for the colorbar. This always uses the denominator when calculating the feature, so for proportions the label should be "Total cells", densities should be "Area", etc.
+        ax_label: str | None
+            Axis label for the feature. This is the x-axis on the histogram and y-axis on the violin plots
+        title: str
+            Title for plot
+        save_dir: str | None
+            If provided, save path for the figure
         """
         fig, ax = plt.subplots(2, 1, figsize = figsize, constrained_layout = True)
         self.hist_plot(model, fitted = fitted, order = order, logx = logx, logy = logy, ax_label = ax_label, show = False, ax = ax[0])
         self.strip_plot(model, fitted = fitted, order = order, log = logy, cbar_label=cbar_label, ax_label=ax_label, show = False, ax = ax[1])
         fig.suptitle(title)
+        if save_dir is not None:
+            plt.savefig(save_dir, bbox_inches = 'tight')
         if show:
             plt.show()
         else:
@@ -813,8 +913,10 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * c_test, c_ref (dict): Dictionaries defining contrast vectors for test and ref classes
-        * name: Name of the current comparison
+        * c_test, c_ref: dict
+            Dictionaries defining contrast vectors for test and ref classes
+        * name: str
+            Name of the feature for the current comparison
         """
 
         if n_jobs is None:
@@ -850,7 +952,10 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * contrasts (List[dict]): List of contrast info. {'test': test_contrast, 'ref': ref_contrast, 'name': name}. Contrasts must be dictionaries defining the classes
+        contrasts: list[dict[dict]]
+            List of contrasts. Each contrast must have take the form:
+            {'test': test_contrast, 'ref': ref_contrast, 'name': name}
+            where test_contrast and ref_contrast are dictionaries defining the test and ref class
         """     
         out = defaultdict(dict)
         if not isinstance(contrasts, list):
@@ -864,6 +969,11 @@ class GLMCollection():
     def run_stats_pairwise(self, **kwargs):
         """
         Loops over every pairwise comparisons where all predictors but 1 are fixed at the same value. Returns a dictionary where the key indicates the comparison, and the values are a stat result dictionary
+        
+        Parameters:
+        -----------
+        **kwargs:
+            Keyword arguments for the run_stats_with_contrasts() function
         """
         
         contrasts = []
@@ -930,10 +1040,11 @@ class GLMCollection():
         
         Parameters:
         -----------
-        * ref_class (dict): {predictor: value} pairs that define the reference class
+        ref_class: dict 
+            {predictor: value} pairs that define the reference class
         """
         
-        # Metadata dictionary
+        # Metadata dictionary for all comparisons
         metadata = defaultdict(dict)
         # Check to make sure ref_class is correctly defined
         for c in self.comparisons:
@@ -965,8 +1076,10 @@ class GLMCollection():
         
         Parameters:
         ------------
-        * contrasts (List[dict]): List of contrast dictionaries
-        * ref_class (dict): Dictionary specifying the reference class
+        contrasts: list[dict] | None
+            List of contrast dictionaries
+        ref_class: dict | None
+            Dictionary specifying the reference class. If None and no contrasts are given, do all pairwise comparisons
         """
         if contrasts is None:
             if ref_class is None:
@@ -981,12 +1094,13 @@ class GLMCollection():
         
     def run_LLR_test(self):
         """
-        Return log likelihood-ratio test for full model. This is a pseudo-anova analysis to see if there are any significant differences from the null model (with no categories)
+        Return log likelihood-ratio test for full model. This is an omnibus test to see if there are any significant differences from the null model (with no categories)
         """
 
-        stats = []
-        indices = []
-        dfs = []
+        stats = [] # Log likelihood test statistics
+        indices = [] # Feature names to be used as index for output dataframe
+        dfs = [] # Difference in degrees of freedom between full and reduced model
+        pvals = [] # Asymptotic p-values for the llr test statistic
         for idx in self.results:
             if not self.converged[idx] or not self.converged_null[idx]:
                 continue
@@ -997,7 +1111,9 @@ class GLMCollection():
             stats.append(stat)
             indices.append(idx)
             dfs.append(df)
-        out = pd.DataFrame({'stat': stats, 'df': dfs}, index = indices)
+            p = chi2.sf(stat, df = df)
+            pvals.append(p)
+        out = pd.DataFrame({'stat': stats, 'df': dfs, 'p-wilks': pvals}, index = indices)
         out.index.name = 'feature'
         out[['Celltype', 'Region', 'feature_type']] = out.index.to_series().apply(get_celltype_annot_region_feature_type).apply(pd.Series)
         return out
@@ -1008,9 +1124,12 @@ class GLMCollection():
         
         Parameters:
         ------------
-        * df: Pandas dataframe of all aggregated features and metadata
-        * perm_cols: Columns to permute (if none, permute all patients)
-        * random_state: for reproducibility when shuffling (needed to calculate correlation between features)
+        df: pd.DataFrame
+            Dataframe of all aggregated features and metadata
+        perm_cols: str | None
+            Columns to permute (if none, permute all patients)
+        random_state: int | None
+            for reproducibility when shuffling (needed to calculate correlation between features)
         """
         warnings.filterwarnings('ignore', message = '^DataFrameGroupBy.apply operated on the grouping columns.*', category = FutureWarning)
 
@@ -1020,10 +1139,12 @@ class GLMCollection():
             perm_cols = [perm_cols]
         if not set(self.group_key).issubset(set(perm_cols)):
             perm_cols = list(set(perm_cols + self.group_key))
+        
+        # Get all unique combinations of patient information
         shuffled_df = df[perm_cols].drop_duplicates()
         shuffled_df['tmp_idx'] = shuffled_df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
         
-        # Make a shuffle dictionary to map
+        # Make a shuffle dictionary to map original -> shuffled patient information
         rng = np.random.default_rng(random_state)
         shuffle_dict = dict(zip(shuffled_df['tmp_idx'], rng.permutation(shuffled_df['tmp_idx'])))
         shuffled_df['tmp_idx'] = shuffled_df['tmp_idx'].map(shuffle_dict)
@@ -1043,10 +1164,13 @@ class GLMCollection():
         
         Parameters:
         ------------
-        * contrasts (List[dict]): List of dictionaries with contrast info. Contrasts must have 3 keys: 'name' to match the name of the comparison from the actual data stat res, 'test' and 'ref': contrasts for the test and ref groups (as pd.Series)
-        * n_jobs: Number of jobs for single permutation (inner parallelization)
-        * group_cols, perm_cols: Columns to group and to shuffle.
-                                 Example: If I want to shuffle HPV status within diagnosis stages, I would use group_cols = 'Diagnosis' and perm_cols = 'HR_HPV'
+        contrasts: list[dict] | None
+            List of dictionaries with contrast info. Contrasts must have 3 keys: 'name' to match the name of the comparison from the actual data stat res, 'test' and 'ref': contrasts for the test and ref groups (as pd.Series)
+        n_jobs: int | None
+            Number of jobs for single permutation (inner parallelization)
+        group_cols, perm_cols: str | list[str]
+            Columns to group and to shuffle.
+            Example: If I want to shuffle HPV status within diagnosis stages, I would use group_cols = 'Diagnosis' and perm_cols = 'HR_HPV'
         """
         
         with warnings.catch_warnings(record = True) as w:
@@ -1111,12 +1235,18 @@ class GLMCollection():
         
         Parameters:
         ------------
-        * contrasts: List of dictionaries containing 'name'= name of comparison, 'c_test'= test contrast, and 'c_ref'= ref contrast. If None, default to all pairwise comparisons
-        * n_permutations: Number of permutations to run
-        * n_jobs: Number of jobs to run for permutation tests
-        * n_jobs_inner: Number of jobs to run within each permutation test. Since we can't do nested parallelism, either this or n_jobs must be set to 1
-        * random_state: seed for reproducibility
-        * kwargs: arguments for _run_single_permutation()
+        contrasts: list[dict] | None
+            List of dictionaries containing 'name'= name of comparison, 'c_test'= test contrast, and 'c_ref'= ref contrast. If None, default to all pairwise comparisons
+        n_permutations: int
+            Number of permutations to run
+        n_jobs: int
+            Number of jobs to run for permutation tests
+        n_jobs_inner: int
+            Number of jobs to run within each permutation test. Since we can't do nested parallelism, this will be set to 1 if n_jobs > 1
+        random_state: int | None
+            seed for reproducibility
+        kwargs:
+            Keyword arguments for _run_single_permutation()
         """
         out = defaultdict(pd.DataFrame)
 

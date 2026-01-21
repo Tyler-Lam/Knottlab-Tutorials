@@ -70,7 +70,10 @@ def tqdm_joblib(tqdm_object):
 def log_comb(n, k):
     return gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
 
-def get_celltype_annot_region_feature_type(col):
+def get_celltype_annot_region_feature_type(
+    col,
+    annot_dict = {'2': 'Stroma', '3': 'Epithelium', '0': 'All Tissue'},
+):
     """
     Given a column name, return the cell type, annotation region, and feature type. This assumes columns formatted according to the tutorial
     Feature types that this can return are:
@@ -80,11 +83,17 @@ def get_celltype_annot_region_feature_type(col):
     * {cell_category}_spatial_correlation_central_cell_{central_celltype}
     * {cell_category}_covering_fraction_{celltype_1}
     where {cell_category} is primary_celltype, secondary_celltype, etc.
+    
+    Parameters:
+    -----------
+    col: str
+        Column name to parse
+    annot_dict: dict
+        Dictionary mapping annotation mask values to region names
     """
     
     region = col.split('annot_region_')[1][0] if 'annot_region' in col else '0'
     celltype = col.split('___')[-1]
-    annot_dict = {'2': 'Stroma', '3': 'Epithelium', '0': 'All Tissue'} # For our project, we only have two values for our annotation masks
     subtype_pattern = re.compile(f".*proportion_per_.*_per_annot_region_.*")
     feature_type = ''
     if subtype_pattern.match(col):
