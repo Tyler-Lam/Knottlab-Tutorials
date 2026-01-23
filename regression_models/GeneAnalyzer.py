@@ -59,7 +59,7 @@ class GeneAnalyzer():
             Path to gene set .txt file to create the gene_dict. If none, use the MSigDB_hallmark_2020
             pathway set compiled by Rick
         layer: str | None
-            If not None, key for counts layer to aggregate data. If None, use anndata.X
+            If not None, key for counts layer to aggregate data. If None, use adata.X
         """
         
         self.adata = adata.copy()
@@ -176,45 +176,49 @@ class GeneAnalyzer():
             self.is_grouped = True
             if show_progress:
                 print(f"done: {(time.time() - t0)/60:.2f} min")
-        
-        for _, row in (pbar := tqdm(self.adata.obs[self.group_key].drop_duplicates().iterrows(), total = len(self.adata.obs[self.group_key].drop_duplicates()), disable = not show_progress)):
-            key = tuple([str(row[g]) for g in self.group_key])
-            pbar.set_description(f"Running PyDeseq2 for {key}")
-            
-            # Check if group should be skipped
-            skip_group = False
-            for g in self.group_key:
-                if row[g] in self.skip[g]:
-                    skip_group = True
-                    break
-            if skip_group:
-                continue
-            # Get only cells in the given category:
-            bdata = self.adata[self.adata.obs[self.group_key].eq(row).all(axis = 1)].copy()
-            # Require >=3 patients with nonzero counts for each gene
-            bdata = bdata[:, (bdata.layers['sum'] > 1).sum(axis = 0) >= 3].copy()
-            # Make count dataframe for the deseq data set
-            counts = pd.DataFrame(bdata.layers['sum'], columns = bdata.var_names)
-            # Make the deseq dataset and run the statistical test
-            dds = DeseqDataSet(
-                counts = counts,
-                metadata = bdata.obs,
-                design = self.design,
-                quiet = True,
-                **dds_kwargs,
-            )
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message = '.*dispersion trend curve fitting did not converge.*', category = UserWarning)
-                dds.deseq2()
-            self.dds[key] = dds
-            stats = DeseqStats(
-                dds, 
-                quiet = True,
-                **ds_kwargs)
-            
-            stats.summary()
-            self.ds[key] = stats.results_df.copy()
-    
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message = '.*dispersion trend curve fitting did not converge.*', category = UserWarning)
+
+            for _, row in (pbar := tqdm(self.adata.obs[self.group_key].drop_duplicates().iterrows(), total = len(self.adata.obs[self.group_key].drop_duplicates()), disable = not show_progress)):
+                key = tuple([str(row[g]) for g in self.group_key])
+                pbar.set_description(f"Running PyDeseq2 for {key}")
+                    
+                try:
+                    # Check if group should be skipped
+                    skip_group = False
+                    for g in self.group_key:
+                        if row[g] in self.skip[g]:
+                            skip_group = True
+                            break
+                    if skip_group:
+                        continue
+                    # Get only cells in the given category:
+                    bdata = self.adata[self.adata.obs[self.group_key].eq(row).all(axis = 1)].copy()
+                    # Require >=3 patients with nonzero counts for each gene
+                    bdata = bdata[:, (bdata.layers['sum'] > 1).sum(axis = 0) >= 3].copy()
+                    # Make count dataframe for the deseq data set
+                    counts = pd.DataFrame(bdata.layers['sum'], columns = bdata.var_names)
+                    # Make the deseq dataset and run the statistical test
+                    dds = DeseqDataSet(
+                        counts = counts,
+                        metadata = bdata.obs,
+                        design = self.design,
+                        quiet = True,
+                        **dds_kwargs,
+                    )
+                    dds.deseq2()
+                    self.dds[key] = dds
+                    stats = DeseqStats(
+                        dds, 
+                        quiet = True,
+                        **ds_kwargs)
+                    
+                    stats.summary()
+                    self.ds[key] = stats.results_df.copy()
+                except Exception as e:
+                    print(f"   Deseq2 fitting for group {key} failed: {e}")
+                    traceback.print_exc()
+
     def run_gsva(self, gsva_kwargs = {}, show_progress = True):
         """
         Run the GSVA analysis. Must run Deseq2 analysis first to get normalized counts
@@ -597,7 +601,13 @@ class GeneAnalyzer():
             Show tqdm progress bar for permutations
         """
         
-        stat_res = self.run_stats(contrast = contrast) if self.results_df is None else self.results_df
+        stat_res = self.run_analysis(
+            contrast = contrast,
+            dds_kwargs = dds_kwargs,
+            ds_kwargs = ds_kwargs,
+            gsva_kwargs = gsva_kwargs,
+            fit_kwargs=fit_kwargs,
+            show_progress = show_progress) if self.results_df is None else self.results_df
         
         perm_res = self._run_permutations(
             contrast = contrast,
