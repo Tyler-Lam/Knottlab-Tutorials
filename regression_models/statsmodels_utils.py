@@ -596,7 +596,7 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', n_jobs = None):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', n_jobs = 1):
     """
     Run benjamini bogomolov FDR correction by clustering features by spearman correlation across permutations
     
@@ -768,7 +768,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Define the final fdr-q-value as the smallest alpha at which a feature would be significant
     clusters_df['fdr-q-val'] = 1.0
     for a in tqdm(np.linspace(1, 0, 1001), desc = "Calculating final FDR q-values"):
-        R = len(simes_df[simes_df < alpha])
+        R = len(simes_df[simes_df['p-simes-adj'] < a])
         m = len(simes_df)
         a_adj = a * R / m
         signif = (clusters_df['p-simes-adj'] < a) & (clusters_df['cluster-p-adj'] < a_adj)
