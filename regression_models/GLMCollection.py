@@ -73,7 +73,7 @@ def _fit_single_model(model_name, model, maxiter = 5000, fit_kwargs = {}):
 
     return (model_name, result, converged, important_warnings)
 
-def _run_single_comparison(res, c_test, c_ref, name):
+def _run_single_comparison(res, c, name):
     """
     Get the stat results for one model given a test contrast, ref contrast, and model name
     Used to parallelize stat calculations for all 
@@ -82,8 +82,8 @@ def _run_single_comparison(res, c_test, c_ref, name):
     -----------
     res: statsmodels fit results object
         Fit result to get comparisons from
-    c_test, c_ref: pd.Series
-        Contrast vector for test and reference classes. Formatted automatically by GLMCollection.cond()
+    c: pd.Series
+        Contrast vector for test. Formatted automatically by GLMCollection.cond() or GLMCollection.get_contrast_vector()
     name: str
         Model name. Used to index the stat dataframe
     
@@ -92,19 +92,17 @@ def _run_single_comparison(res, c_test, c_ref, name):
     y = res.model.endog
     x = res.model.exog
     
-    idx_t = set(c_test.index.values)
-    idx_t_new = [x for x in res.model.exog_names if x in idx_t]
-    idx_r = set(c_ref.index.values)
-    idx_r_new = [x for x in res.model.exog_names if x in idx_r]
-    c_test = c_test[idx_t_new]
-    c_ref = c_ref[idx_r_new]
-    c = c_test - c_ref
+    # Jank way of making the contrast vectors consistent with the models
+    idx_c = set(c.index.values)
+    # Make sure coefficients are actually in the model and haven't been removed due to low statistics
+    idx_c_new = [x for x in res.model.exog_names if x in idx_c] 
+    c = c[idx_c_new]
     
     # If the result is not converged
     if np.isnan(res.bse).any() or not res.mle_retvals['converged']:
         return (np.nan, np.nan, np.nan, np.nan, name)
     # If the comparison contains categories that were removed from the given model
-    if not idx_t.issubset(set(res.model.exog_names)) or not idx_r.issubset(set(res.model.exog_names)):
+    if not idx_c.issubset(set(res.model.exog_names)):
         return (np.nan, np.nan, np.nan, np.nan, name)
     try:
         contrast = pd.Series(0, index = res.params.index)
@@ -126,7 +124,8 @@ class GLMCollection():
         comparisons,
         formula = None,
         null_formula = None,
-        agg_features = None
+        agg_features = None,
+        stratify_by = None,
     ):
         """
         Class to store beta-binomial and gamma-poisson GLMs and perform fits/permutation testing
@@ -149,12 +148,16 @@ class GLMCollection():
             Formulaic formula for the null model design matrix. If None, default to ~1 (constant design matrix)
         agg_features: pd.Dataframe | None
             Aggregated feature dataframe. If None, aggregate features when adding all models
+        stratify_by: str | List[str] | None
+            Column(s) to stratify feature removal and permutations. If your null design is not constant,
+            this should be equal to the columns used in the null formula. Must be a subset of the comparisons
         """
         
         self.features_raw = features
         self.preselection = [preselection] if isinstance(preselection, str) else preselection
         self.group_key = group_key if isinstance(group_key, list) else [group_key]
-        self.comparisons = comparisons if isinstance(group_key, list) else [comparisons]
+        self.comparisons = comparisons if isinstance(comparisons, list) else [comparisons]
+        self.stratify_by = [stratify_by] if isinstance(stratify_by, str) else stratify_by
 
         if isinstance(self.preselection, dict):    
             # Filter based on preselection and nan-values in predictors
@@ -284,7 +287,8 @@ class GLMCollection():
         cols_to_add,
         skip = defaultdict(list),
         verbose = True,
-        show_progress = True
+        show_progress = True,
+        min_counts = 2,
     ):
         """
         Add all models to the GLMCollection. From Aagam's modifications
@@ -295,6 +299,10 @@ class GLMCollection():
             List of columns to add to model
         skip: dict[list]
             Dictionary of cell types to skip (see _parse_feature_name method)
+        stratify_col: str | List[str] | None
+            Column(s) for stratification removal. If a category sharing this column is removed, all categories with this column are removed
+        min_counts: int
+            Minimum number of nonzero values per cohort
         """
         
         # Get the model info for all columns to add
@@ -337,8 +345,10 @@ class GLMCollection():
                 # --- A. Construct feature-specific aggregated DataFrame ---
                 agg_df = pd.DataFrame(self.agg_features[counts_col]).rename(columns={counts_col: 'counts'})
                 
-                # Require categories to have >=2 patients with nonzero counts
-                nonzero = agg_df.groupby(self.comparisons)['counts'].apply(lambda x: sum(x > 0)) >= 2
+                # Require categories to have >= min_counts patients with nonzero counts
+                nonzero = agg_df.groupby(self.comparisons)['counts'].apply(lambda x: sum(x > 0)) >= min_counts
+                if self.stratify_by is not None:
+                    nonzero = nonzero.groupby(level = self.stratify_by).transform('all')
                 valid = nonzero[nonzero].index.to_frame(index = False)
                 if len(valid) <= 1:
                     warnings.warn(f'Category {val_col} has less than 2 valid categories. Skipping model.', UserWarning)
@@ -629,6 +639,39 @@ class GLMCollection():
                 pass
         return contrast
 
+    def get_contrast_vector(self, *args, model = None, null = False):
+        """
+        Function to convert a GenericContrast object to a contrast vector
+        
+        Parameters:
+        ------------
+        args: tuple(dict[dict], func) | GenericContrast
+            If tuple, the first element must be a dictionary with values representing conditions for contrast vectors
+            The second element must be a function with arguments represented by the keys of the conditions
+        model: str | None (optional):
+            If provided, make the contrast vector for the specific model. This is useful because
+            cohorts can be removed due to low statistics for some features but not others
+        null: bool
+            Get the contrast vector for the null model instead of the full model
+        """
+        if len(args) == 1:
+            if isinstance(args[0], GenericContrast):
+                conditions = args[0].conditions
+                op = args[0].op
+            else:
+                raise ValueError(f"Input for get_contrast_vector must be a dictionary of conditions + an operation or a GenericContrast object. Received {type(args[0])}")
+        elif len(args) == 2:
+            conditions = args[0]
+            op = args[1]
+        else:
+            raise ValueError(f"Input for get_contrast_vector must be a dictionary of conditions + an operation or a GenericContrast object. Received {[type(a) for a in args]}")
+        if not null:
+            contrasts = {name: self.cond(**c, model = model) for name, c in conditions.items()}
+        else:
+            contrasts = {name: self.cond_null(**c, model = model) for name, c in conditions.items()}
+        
+        return op(**contrasts)
+
     def hist_plot(
         self,
         model,
@@ -703,7 +746,7 @@ class GLMCollection():
         if fitted:
             pdfs = {}
             pdf_max = 0 # Max value of pdf for shared normalization
-            for i, cat in enumerate(x_pos.keys()):
+            for cat, i in x_pos.items():
                 if cat not in self.features[model]['classification'].unique():
                     continue
                 # Get col: val pairs from the classification names
@@ -715,7 +758,7 @@ class GLMCollection():
                 # For the get_pdf methods, contrast is only for the regressor coefficients
                 pdfs[cat] = result.get_pdf(x, contrast)
                 pdf_max = max(pdf_max, pdfs[cat][np.isfinite(pdfs[cat])].max())
-                ax.plot(x, pdfs[cat], '-')
+                ax.plot(x, pdfs[cat], '-', color = f"C{i}")
                 
             ax.set_ylim(None, ymax if (ymax > pdf_max) else min(1.2 * pdf_max, 2*ymax))
         # Histogram plot formatting
@@ -907,25 +950,32 @@ class GLMCollection():
         else:
             return ax
             
-    def get_stat_df_parallel(self, c_test, c_ref, name, n_jobs = None):
+    def get_stat_df_parallel(self, c, name, n_jobs = None):
         """
         Get the stat dataframe for all models
         
         Parameters:
         -----------
-        * c_test, c_ref: dict
+        * c: pd.Series | GenericContrast | dict
             Dictionaries defining contrast vectors for test and ref classes
         * name: str
             Name of the feature for the current comparison
         """
-
         if n_jobs is None:
             n_jobs = multiprocessing.cpu_count() - 1
             
         if n_jobs == 1:
-            results = [_run_single_comparison(res, self.cond(model = feat, **c_test), self.cond(model = feat, **c_ref), feat) for feat, res in self.results.items()]
+            results = [
+                _run_single_comparison(
+                    res,
+                    c if isinstance(c, pd.Series) else self.get_contrast_vector(c, model = feat),
+                    feat) for feat, res in self.results.items()]
         else:
-            tasks = [delayed(_run_single_comparison)(res, self.cond(model = feat, **c_test), self.cond(model = feat, **c_ref), feat) for feat, res in self.results.items()]
+            tasks = [delayed(_run_single_comparison)(
+                res, 
+                c if isinstance(c, pd.Series) else self.get_contrast_vector(c, model = feat),
+                feat) for feat, res in self.results.items()
+            ]
             results = Parallel(n_jobs = n_jobs)(tasks)
             
         out_index = []
@@ -944,7 +994,7 @@ class GLMCollection():
         out = pd.DataFrame({'t-wald': t_wald, 'p-wald': p_wald, 'effect': effect, 'effectSE': effectSE}, index = out_index)
         out[['Celltype', 'Region', 'feature_type']] = out.index.to_series().apply(get_celltype_annot_region_feature_type).apply(pd.Series)
         out.index.name = 'feature'
-        return {'df': out, 'c_test': c_test, 'c_ref': c_ref, 'name': name}
+        return {'df': out, 'contrast': c, 'name': name}
         
     def run_stats_with_contrasts(self, contrasts, show_progress = True, n_jobs = None):
         """
@@ -952,23 +1002,22 @@ class GLMCollection():
         
         Parameters:
         -----------
-        contrasts: list[dict[dict]]
-            List of contrasts. Each contrast must have take the form:
-            {'test': test_contrast, 'ref': ref_contrast, 'name': name}
-            where test_contrast and ref_contrast are dictionaries defining the test and ref class
+        contrasts: list[GenericContrast]
+            List of GenericContrast object defining your comparisons
         """     
         out = defaultdict(dict)
         if not isinstance(contrasts, list):
             contrasts = [contrasts]
         for c in tqdm(contrasts, desc = 'Getting stat dataframes', disable = not show_progress):
-            out[c['name']] = self.get_stat_df_parallel(c['test'], c['ref'], c['test'], n_jobs = n_jobs)   
-            out[c['name']]['ref_group'] = c['ref']
-            out[c['name']]['test_group'] = c['test']
+            out[c.name] = self.get_stat_df_parallel(c, c.name, n_jobs = n_jobs)  
+            for name, cond in c.conditions.items():
+                out[c.name][name] = cond 
         return out
 
     def run_stats_pairwise(self, **kwargs):
         """
         Loops over every pairwise comparisons where all predictors but 1 are fixed at the same value. Returns a dictionary where the key indicates the comparison, and the values are a stat result dictionary
+        This function does not do wald tests on interaction terms
         
         Parameters:
         -----------
@@ -995,13 +1044,14 @@ class GLMCollection():
                     cont_test = {comp: pair[0]}
                     cont_ref = {comp: pair[1]}
 
-                    contrasts.append({'name': name, 'test': cont_test, 'ref': cont_ref})
+                    conditions = dict(test = cont_test, ref = cont_ref)
+                    contrasts.append(GenericContrast(conditions, name = name))
                     metadata[name]['comparison'] = comp
                     # Dictionaries for contrasts
                     metadata[name]['test_group'] = cont_test
                     metadata[name]['ref_group'] = cont_ref
                     # Dictionary of control variables
-                    metadata[name]['control'] = self.preselection
+                    metadata[name]['control'] = self.preselection.copy()
                     
             # If there are other predictors, loop over all combinations and run pairwise comparisons for each
             else:
@@ -1017,14 +1067,15 @@ class GLMCollection():
                             cont_ref[c] = row[c]
                             name += f'___{c}__{row[c]}'
                         
-                        contrasts.append({'name': name, 'test': cont_test, 'ref': cont_ref})
+                        condition = dict(test = cont_test, ref = cont_ref)
+                        contrasts.append(GenericContrast(condition, name = name))
                         metadata[name] = {}
                         metadata[name]['comparison'] = comp
                         # Dictionaries for contrasts
                         metadata[name]['test_group'] = cont_test
                         metadata[name]['ref_group'] = cont_ref
                         # Dictionary of control variables
-                        metadata[name]['control'] = self.preselection
+                        metadata[name]['control'] = self.preselection.copy()
                         if isinstance(self.preselection, dict):
                             metadata[name]['control'].update({c: row[c] for c in others})
                         elif isinstance(self.preselection, list):
@@ -1062,7 +1113,8 @@ class GLMCollection():
             test_class = {c: row[c] for c in self.comparisons}
             
             name = '___'.join([f"{c}__{row[c]}" for c in self.comparisons])
-            contrasts.append({'name': name, 'test': test_class, 'ref': ref_class})
+            conditions = dict(test = test_class, ref = ref_class)
+            contrasts.append(GenericContrast(conditions, name = name))
             metadata[name]['ref_group'] = ref_class
             metadata[name]['test_group'] = test_class
         stat_res = self.run_stats_with_contrasts(contrasts, **kwargs)
@@ -1076,8 +1128,8 @@ class GLMCollection():
         
         Parameters:
         ------------
-        contrasts: list[dict] | None
-            List of contrast dictionaries
+        contrasts: list[GenericContrast] | None
+            List of comparisons given by GenericContrasts
         ref_class: dict | None
             Dictionary specifying the reference class. If None and no contrasts are given, do all pairwise comparisons
         """
@@ -1158,7 +1210,13 @@ class GLMCollection():
         
         return df
         
-    def _run_single_permutation(self, contrasts = None, n_jobs = None, group_cols = None, perm_cols = None, random_state = None, verbose = False):
+    def _run_single_permutation(
+        self,
+        contrasts = None,
+        n_jobs = None,
+        min_counts = 2,
+        random_state = None,
+        verbose = False):
         """
         Run the statistical analysis on a single permutation. Shuffle the patients by group_key and get the stat dataframes for each comparison
         
@@ -1168,34 +1226,30 @@ class GLMCollection():
             List of dictionaries with contrast info. Contrasts must have 3 keys: 'name' to match the name of the comparison from the actual data stat res, 'test' and 'ref': contrasts for the test and ref groups (as pd.Series)
         n_jobs: int | None
             Number of jobs for single permutation (inner parallelization)
-        group_cols, perm_cols: str | list[str]
-            Columns to group and to shuffle.
-            Example: If I want to shuffle HPV status within diagnosis stages, I would use group_cols = 'Diagnosis' and perm_cols = 'HR_HPV'
         """
         
         with warnings.catch_warnings(record = True) as w:
             warnings.simplefilter("always")
-            if perm_cols is None:
-                perm_cols = self.group_key + self.comparisons
-            else:
-                if not isinstance(perm_cols, list):
-                    perm_cols = [perm_cols]
-                perm_cols = perm_cols + self.group_key
+            perm_cols = self.group_key + self.comparisons
+            if self.stratify_by is not None:
+                for x in self.stratify_by:
+                    if x in perm_cols:
+                        perm_cols.remove(x) 
 
             # Permute the metadata by patient + comparison
             # We include the comparison because sometimes a single patient can be in different categories
             # across multiple samples
             # e.g. one patient can have an HPV+ and HPV- sample
             df = self.agg_features.copy().reset_index()
-            if not group_cols:
+            if self.stratify_by is None:
                 df = self._shuffle_agg_df(df, random_state = random_state)
             else:
-                df = df.groupby(group_cols, group_keys = False).apply(lambda g: self._shuffle_agg_df(g, perm_cols = perm_cols, random_state = random_state), include_groups = True)
+                df = df.groupby(self.stratify_by, group_keys = False).apply(lambda g: self._shuffle_agg_df(g, perm_cols = perm_cols, random_state = random_state), include_groups = True)
 
             try:
                 # Make a new dataframe with the shuffled features, including the aggregated features to skip the groupby function
-                glms = GLMCollection(df, {}, self.group_key, self.comparisons, formula = self.formula, null_formula = self.null_formula, agg_features=df.set_index(self.group_key + self.comparisons))
-                glms.add_models_batch(list(self.features.keys()), verbose = False, show_progress = False)
+                glms = GLMCollection(df, {}, self.group_key, self.comparisons, formula = self.formula, null_formula = self.null_formula, stratify_by = self.stratify_by, agg_features=df.set_index(self.group_key + self.comparisons))
+                glms.add_models_batch(list(self.features.keys()), min_counts = min_counts, verbose = False, show_progress = False)
                 glms.fit_models_parallel(verbose = False, show_progress = False, n_jobs = n_jobs)
                 glms.fit_null_models_parallel(verbose = False, show_progress = False, n_jobs = n_jobs)
                 
@@ -1229,7 +1283,15 @@ class GLMCollection():
                 ))
         return out_res
     
-    def run_permutations_parallel(self, contrasts = None, n_permutations = 1000, show_progress = True, n_jobs = None, n_jobs_inner = None, random_state = None, **kwargs):
+    def run_permutations_parallel(
+        self,
+        contrasts = None,
+        n_permutations = 1000,
+        show_progress = True,
+        n_jobs = None,
+        n_jobs_inner = None,
+        random_state = None,
+        **kwargs):
         """
         Run permutations in parallel
         
@@ -1259,7 +1321,14 @@ class GLMCollection():
                 results = []
                 for i in tqdm(range(n_permutations), desc = 'Running permutation tests', disable = not show_progress):
                     rs = random_state if random_state is None else random_state + i
-                    results.append(self._run_single_permutation(contrasts = contrasts, n_jobs = n_jobs_inner, random_state = rs, **kwargs))
+                    results.append(
+                        self._run_single_permutation(
+                            contrasts = contrasts, 
+                            n_jobs = n_jobs_inner,
+                            random_state = rs,
+                            **kwargs
+                        )
+                    )
             
             # If permutations are done in parallel, make each permutation take one job
             else:
@@ -1295,7 +1364,16 @@ class GLMCollection():
                 out[key] = pd.concat([out[key], tmp_df], axis = 0, join = 'outer')
         return out
     
-    def run_stats_with_permutations(self, n_permutations = 1000, n_jobs = None, n_jobs_inner = None, show_progress = True, ref_class = None, contrasts = None, do_pairwise = True, **kwargs):
+    def run_stats_with_permutations(
+        self, 
+        n_permutations = 1000,
+        n_jobs = None,
+        n_jobs_inner = None,
+        show_progress = True,
+        ref_class = None,
+        contrasts = None,
+        do_pairwise = True,
+        **kwargs):
         """
         Run the statistical test with permutations for empirical p-values
         Empirical p-values are calculated as the fraction of null test statistics greater than the nominal wald test statistic. These are saved as p-wald-nom (or p-nom for the LLR test)
@@ -1307,7 +1385,7 @@ class GLMCollection():
         ------------
         * n_permutations, n_jobs, verbose are the same as the run_permutations() function
         * n_jobs, n_jobs_inner: number of jobs for inner/outer parallelization. Due to joblib we can either do inner or outer parallelization, but not both
-        * contrasts (List[dict] / dict): Contrast metadata dictionary defining the groups for pairwise comparisons
+        * contrasts (List[GenericContrast] / GenericContrast): Contrast metadata dictionary defining the groups for pairwise comparisons
         * do_pairwise: If contrasts is None, do pairwise comparisons. If False and contrasts is None, only perform the LLR test and skip pairwise comparisons
         * ref_class (dict): Dictionary specifying the reference class predictors. If none, do all pairwise comparisons
         * kwargs: Keyword arguments for _run_single_permutation()
@@ -1325,7 +1403,7 @@ class GLMCollection():
                 
                 # Get all contrasts from the original stat results
                 for key in stat_res:
-                    contrasts.append(dict(name = key, test = stat_res[key]['test_group'], ref = stat_res[key]['ref_group']))
+                    contrasts.append(stat_res[key]['contrast'])
         # Run comparisons if contrasts are given
         else:
             if not isinstance(contrasts, list):

@@ -46,7 +46,9 @@ import scanpy as sc
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
 import gseapy as gp
-            
+
+import gc
+
 # Stackoverflow solution to make tqdm work with joblib.Parallel
 # https://stackoverflow.com/questions/24983493/tracking-progress-of-joblib-parallel-execution/58936697#58936697
 @contextlib.contextmanager
@@ -65,6 +67,55 @@ def tqdm_joblib(tqdm_object):
         joblib.parallel.BatchCompletionCallBack = old_batch_callback
         tqdm_object.close()
         
+
+class GenericContrast:
+    """
+    Class to do generic manipulation of multiple contrast vectors by an operation. Stores the conditions
+    and the operation for each contrast to be applied to a design matrix
+
+    Parameters:
+    ------------
+    conditions: dict[dict]
+        Set of conditions that define contrast vectors. Each key represents the name of
+        a contrast vector
+    op: func
+        Function that takes in a set of contrast vectors and returns one contrast vector.
+        By default, if 2 conditions are given, the operation takes a "test" and "ref" vector and calculates the difference
+        If 1 is given, the contrast vector is returned for the given condition
+    name: str
+        Name for the given comparison represented by the contrast
+    
+    Example: To setup a contrast to measure the difference between Diagnosis stage A and B
+    conditions = {
+        'test': dict(Diagnosis = "A"),
+        'ref': dict(Diagnosis = "B")
+    }
+    op = lambda test, ref: test - ref
+    name = 'A_vs_B'
+    
+    Example: To setup a contrast to see if treatment has a different effect in groups A and B
+    conditions = {
+        'c1': dict(Diagnosis = "A", treatment = 0),
+        'c2': dict(Diagnosis = "A", treatment = 1)
+        'c3': dict(Diagnosis = "B", treatment = 0),
+        'c4': dict(Diagnosis = "B", treatment = 1),
+    }
+    op = lambda c1, c2, c3, c4: (c2 - c1) - (c4 - c3)
+    name = "A_vs_B___treatment_interaction"
+    
+    """
+    def __init__(self, conditions, op = None, name = ""):
+        self.conditions = conditions
+        self.op = op
+        # Setup some default operations if none are given
+        if op is None:
+            # If only one condition, return contrast vector for that condition
+            if len(conditions) == 1:
+                self.op = lambda **kwargs: next(iter(kwargs.values()))
+            # If two conditions, assume one is 'test' and one is 'ref'
+            if len(conditions) == 2:
+                self.op = lambda test, ref: test - ref
+        self.name = name
 
 # Log(n choose k) for stability in log-likelihood functions
 def log_comb(n, k):
@@ -253,7 +304,7 @@ def make_dotplot(
             
 
 
-def get_progression_df(stat_res, ref_group):
+def get_progression_df(stat_res, ref_group, ref_key = 'ref_group', test_key = 'test_group'):
     """
     Given a statistics result from the GLMCollection, aggregate the dataframes to give feature effects relative to the reference group
     
@@ -270,11 +321,11 @@ def get_progression_df(stat_res, ref_group):
         if key == 'llr':
             continue
         tmp_df = res['df'].copy()
-        if res['ref_group'] == ref_group:
-            for col, val in res['test_group'].items():
+        if res[ref_key] == ref_group:
+            for col, val in res[test_key].items():
                 tmp_df[col] = val
-        elif res['test_group'] == ref_group:
-            for col, val in res['ref_group'].items():
+        elif res[test_key] == ref_group:
+            for col, val in res[ref_key].items():
                 tmp_df[col] = val
                 
             tmp_df['effect'] = -1 * tmp_df['effect']
@@ -585,10 +636,7 @@ def fast_corr(X, pbar = None):
 
 # Calculate the simes p-value given a pandas series of p-values
 def get_simes_p(pvals):
-    sorted_pvals = pvals.sort_values(ascending = True)
-    m = len(sorted_pvals)
-    simes_vals = sorted_pvals * m / np.arange(1, m+1)
-    return simes_vals.min()
+    return min(false_discovery_control(pvals))
 
 # Used for applying fdr control to groups of a dataframe
 def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
@@ -596,7 +644,7 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     return df
 
 # Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', n_jobs = 1):
+def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', n_jobs = None, silhouette_batch_size = None, random_state = None):
     """
     Run benjamini bogomolov FDR correction by clustering features by spearman correlation across permutations
     
@@ -619,15 +667,24 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     n_jobs: int | None
         Number of jobs for calculating clustering threshold from silhouette scores.
         If None, default to ncpus - 1
+    silhouette_batch_size: int | None
+        Batch size for silhouette score calculation. If none, calculate on entire linkage matrix
+    random_state: int | None
+        Random seed for batch sampling of silhouette score
     """
     t_start = time.time()
     print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
     # Filter the permutation df to only use features in the llr df
     sub_perm_df = perm_df[perm_df.index.isin(llr_df.index)]
     
+    t0 = time.time()
+    print("Ranking test statistics ... ", end = "")
     # Make the pivot table and rank dataframe
     pivot = sub_perm_df.reset_index().pivot(index = 'perm_iter', columns = sub_perm_df.index.name, values = stat_col)
     ranks = pivot.rank(axis = 0)
+    del pivot
+    gc.collect()
+    print(f"done: {(time.time() - t0)/60:.2f} min")
     
     # Make the correlation matrix and dataframe
     # Use numba progress bar to track progress
@@ -656,7 +713,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
             feats_to_remove = []
             idx_to_remove = []
             # Remove row/col with the most nans iteratively until none remain
-            print('   Removing features starting with highest nan counts ... ', end = '')
+            print('   Finding features to remove ... ', end = '')
             t0 = time.time()
             while mask.any():
                 # Get the number of times a feature shows in either a row or a column
@@ -672,7 +729,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
                 mask[i, :] = False
                 mask[:, i] = False
             print(f'done: {(time.time() - t0) / 60:.2f} min')
-            print('   Filtering correlation matrix and dataframe for removed features ... ', end = "")
+            print('   Filtering correlation matrix ... ', end = "")
             t0 = time.time()
             # Now make the mask for the correlation matrix 
             mask_to_keep[idx_to_remove] = False
@@ -682,13 +739,16 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
             if len(feats_to_remove) > 0:
                 print(f'Removed the following {len(feats_to_remove)} of {total_nans} features with NaNs:')
                 print(f'{feats_to_remove}')
-
+            del upper_mask, mask, idx_to_remove
+            gc.collect()
     t0 = time.time()
     # Make distance matrix and calculate linkage
     print("   Calculating Distance and linkage matrix ... ", end = "")
     dist = 1 - corr
+    del corr
+    gc.collect()
     dist_condensed = squareform(dist)
-    Z = linkage(dist_condensed, method = 'average') # Unsure if 'average' is proper for this but i guess it works
+    Z = linkage(dist_condensed, method = 'average') 
     print(f"done: {(time.time() - t0) / 60:.2f} min")
 
     # Calculate best threshold for clustering:
@@ -697,8 +757,11 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     best_t = 0
     thresholds = []
     scores = []
-    
-    def get_silhouette_score(Z, t, dist, max_clusters):
+
+    # For testing, use 100 log-uniform thresholds from [0.001, 0.1] and 100 bins from (.1, max(threshold)]
+    thresholds_all = np.concat([np.logspace(-3, -1, 100), np.linspace(.1, np.max(Z[:,2]), 100)[1:]])
+
+    def get_silhouette_score(Z, t, dist, max_clusters, batch_size = None, random_state = None):
         """
         Given linkage Z, threshold t, distance matrix dist, and a max number of clusters,
         return the cluster labels, silhouette score, and threshold
@@ -709,16 +772,34 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         if n_clusters <= 1 or n_clusters >= max_clusters:
             return None
         
-        score = silhouette_score(dist, labels = labels, metric = 'precomputed')
+        if batch_size is not None:
+            scores = []
+            
+            # Repeat sampling until standard error on the mean is < .01
+            SEM = 1
+            while SEM > .01 and len(scores) < 10:
+                scores.append(
+                    silhouette_score(
+                        dist,
+                        label = labels,
+                        metric = 'precomputed',
+                        sample_size = batch_size,
+                        random_state = random_state + len(scores) if random_state is not None else random_state)
+                )
+                se = np.std(scores) / np.sqrt(len(scores))
+                SEM = se / np.mean(scores)
+            score = np.mean(scores)
+        else:
+            score = silhouette_score(dist, labels = labels, metric = 'precomputed', sample_size = batch_size, random_state = random_state)
         return (labels, score, t)
-    
+
     if n_jobs is None:
         n_jobs = multiprocessing.cpu_count() - 1
     if n_jobs > 1:
         tasks = [delayed(
             get_silhouette_score)(
-                Z, t, dist, len(corr)
-            ) for t in np.linspace(0, 1, 100)
+                Z, t, dist, len(dist), batch_size = silhouette_batch_size, random_state = random_state
+            ) for t in thresholds_all
         ]
         
         with tqdm_joblib(tqdm(desc = "Calculating silhouette scores", total = len(tasks))) as pbar:
@@ -726,8 +807,8 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     else:
         results = [
             get_silhouette_score(
-                Z, t, dist, len(corr)
-            ) for t in tqdm(np.linspace(0, 1, 100), desc = "Calculating silhouette scores")
+                Z, t, dist, len(dist), batch_size = silhouette_batch_size, random_state=random_state
+            ) for t in tqdm(thresholds_all, desc = "Calculating silhouette scores")
         ]
         
     for res in results:
@@ -762,7 +843,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Add the simes df for future use
     clusters_df = pd.merge(clusters_df, simes_df, left_on = 'cluster', right_index = True, how = 'left')
     # Apply BH correction within each cluster
-    clusters_df = clusters_df.groupby('cluster').apply(lambda g: apply_fdr(g))
+    clusters_df = clusters_df.groupby('cluster').apply(lambda g: apply_fdr(g, pval_col = pval_col))
     clusters_df.index = clusters_df.index.get_level_values(1)
     
     # Define the final fdr-q-value as the smallest alpha at which a feature would be significant

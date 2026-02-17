@@ -14,8 +14,9 @@ class GeneAnalyzer():
         skip = defaultdict(list),
         design = None,
         design_null = None,
+        stratify_by = None,
         gene_set = None,
-        layer = None
+        layer = None,
     ):
         """
         Class to do Deseq2 and GSVA analysis
@@ -55,6 +56,9 @@ class GeneAnalyzer():
         design_null: str | None (optional)
             Reduced design matrix formula, used to calculate reduced models for the log likelihood ratio tests
             If None, use a constant design matrix
+        stratify_by: str | List[str] | None (optional)
+            Column(s) to stratify for permutations. Permutations will first group by this column,
+            then shuffle labels within groups. Must be a subset of the comparisons
         gene_set: str | None (optional)
             Path to gene set .txt file to create the gene_dict. If none, use the MSigDB_hallmark_2020
             pathway set compiled by Rick
@@ -67,11 +71,14 @@ class GeneAnalyzer():
         self.pseudobulk_key = pseudobulk_key if isinstance(pseudobulk_key, list) else [pseudobulk_key]
         self.group_key = group_key if isinstance(group_key, list) else [group_key]
         self.comparisons = comparisons if isinstance(comparisons, list) else [comparisons]
+        self.stratify_by = [stratify_by] if isinstance(stratify_by, str) else stratify_by
         self.skip = skip
         self.metadata = metadata
         self.meta_merge_key = meta_merge_key
         self.is_grouped = is_grouped
         self.layer = layer
+        self.ran_dds = False # Flag to check if deseq datasets were made
+        self.ran_gsva = False # Flag to check if gsva has been ran
         
         if metadata is not None:
             cols = list(set(self.metadata.columns).intersection(set(self.pseudobulk_key + self.comparisons)))
@@ -115,6 +122,104 @@ class GeneAnalyzer():
         for c in self.gene_set.columns.values:
             self.gene_dict[c] = self.gene_set[c]['geneSymbols']  
             
+            
+    def _run_dds(
+        self,
+        show_progress = True,
+        dds_kwargs = {},
+    ):
+        
+        if not self.is_grouped:
+            if show_progress:
+                print("Pseudobulking anndata ... ", end = "")
+            adata_agg = sc.get.aggregate(self.adata, by = self.pseudobulk_key + self.group_key + self.comparisons, func = 'sum', layer = self.layer)
+            self.adata = adata_agg
+            self.is_grouped = True
+            if show_progress:
+                print(f"done: {(time.time() - t0)/60:.2f} min")
+                
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message = '.*dispersion trend curve fitting did not converge.*', category = UserWarning)
+            for _, row in (pbar := tqdm(self.adata.obs[self.group_key].drop_duplicates().iterrows(), total = len(self.adata.obs[self.group_key].drop_duplicates()), disable = not show_progress)):
+                key = tuple([str(row[g]) for g in self.group_key])
+                pbar.set_description(f"Running PyDeseq2 for {key}")
+                    
+                try:
+                    # Check if group should be skipped
+                    skip_group = False
+                    for g in self.group_key:
+                        if row[g] in self.skip[g]:
+                            skip_group = True
+                            break
+                    if skip_group:
+                        continue
+                    # Get only cells in the given category:
+                    bdata = self.adata[self.adata.obs[self.group_key].eq(row).all(axis = 1)].copy()
+                    # Require >=3 patients with nonzero counts for each gene
+                    bdata = bdata[:, (bdata.layers['sum'] > 1).sum(axis = 0) >= 3].copy()
+                    # Make count dataframe for the deseq data set
+                    counts = pd.DataFrame(bdata.layers['sum'], columns = bdata.var_names)
+                    # Make the deseq dataset and run the statistical test
+                    dds = DeseqDataSet(
+                        counts = counts,
+                        metadata = bdata.obs,
+                        design = self.design,
+                        quiet = True,
+                        **dds_kwargs,
+                    )
+                    dds.deseq2()
+                    
+                    self.dds[key] = dds
+                    
+                except Exception as e:
+                    print(f"   DDS fitting for group {key} failed: {e}")
+                    traceback.print_exc()
+        self.ran_dds = True
+        
+    def _run_ds(
+        self,
+        contrast = None,
+        show_progress = True,
+        ds_kwargs = {},        
+    ):
+        # If a contrast is provided, pass it into the kwargs and use the wald test
+        if contrast is not None:
+            ds_kwargs['contrast'] = contrast
+            ds_kwargs['test'] = 'Wald'
+        # If no contrast is provided, use the likelihood ratio test if none is provided in the ds_kwargs
+        else:
+            if 'contrast' not in ds_kwargs:
+                ds_kwargs['contrast'] = None
+                ds_kwargs['test'] = 'LRT'
+            elif ds_kwargs['contrast'] is None:
+                ds_kwargs['test'] = 'LRT'
+        if 'design_null' not in ds_kwargs:
+            ds_kwargs['design_null'] = self.design_null
+        
+        for key in (pbar := tqdm(self.dds.keys(), disable = not show_progress)):
+            pbar.set_description(f"Running deseq stats for {key}")
+            
+            try:
+                # If contrast is given as a GenericContrast, get the contrast vector as a numpy array
+                if isinstance(ds_kwargs['contrast'], GenericContrast):
+                    contrast = {name: self.dds[key].cond(**c) for name, c in ds_kwargs['contrast'].conditions.items()}
+                    ds_kwargs['contrast'] = ds_kwargs['contrast'].op(**contrast).values
+                elif isinstance(ds_kwargs['contrast'], pd.Series):
+                    ds_kwargs['contrast'] = ds_kwargs['contrast'].values
+                    
+                stats = DeseqStats(
+                    self.dds[key],
+                    quiet = True,
+                    **ds_kwargs
+                )
+                stats.summary()
+                self.ds[key] = stats.results_df.copy()
+                
+            except Exception as e:
+                print(f"   Deseq2 fitting for group {key} failed: {e}")
+                traceback.print_exc()
+                
+
     def run_deseq2(
         self,
         contrast = None,
@@ -127,7 +232,7 @@ class GeneAnalyzer():
         
         Parameters:
         ------------
-        contrast : list  | np.ndarray | dict(dict)
+        contrast : list  | np.ndarray | dict(dict) | GenericContrast
             If a contrast is provided, the test will default to the Wald test. Otherwise defaults to
             the likelihood ratio test
             
@@ -176,48 +281,18 @@ class GeneAnalyzer():
             self.is_grouped = True
             if show_progress:
                 print(f"done: {(time.time() - t0)/60:.2f} min")
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message = '.*dispersion trend curve fitting did not converge.*', category = UserWarning)
-
-            for _, row in (pbar := tqdm(self.adata.obs[self.group_key].drop_duplicates().iterrows(), total = len(self.adata.obs[self.group_key].drop_duplicates()), disable = not show_progress)):
-                key = tuple([str(row[g]) for g in self.group_key])
-                pbar.set_description(f"Running PyDeseq2 for {key}")
-                    
-                try:
-                    # Check if group should be skipped
-                    skip_group = False
-                    for g in self.group_key:
-                        if row[g] in self.skip[g]:
-                            skip_group = True
-                            break
-                    if skip_group:
-                        continue
-                    # Get only cells in the given category:
-                    bdata = self.adata[self.adata.obs[self.group_key].eq(row).all(axis = 1)].copy()
-                    # Require >=3 patients with nonzero counts for each gene
-                    bdata = bdata[:, (bdata.layers['sum'] > 1).sum(axis = 0) >= 3].copy()
-                    # Make count dataframe for the deseq data set
-                    counts = pd.DataFrame(bdata.layers['sum'], columns = bdata.var_names)
-                    # Make the deseq dataset and run the statistical test
-                    dds = DeseqDataSet(
-                        counts = counts,
-                        metadata = bdata.obs,
-                        design = self.design,
-                        quiet = True,
-                        **dds_kwargs,
-                    )
-                    dds.deseq2()
-                    self.dds[key] = dds
-                    stats = DeseqStats(
-                        dds, 
-                        quiet = True,
-                        **ds_kwargs)
-                    
-                    stats.summary()
-                    self.ds[key] = stats.results_df.copy()
-                except Exception as e:
-                    print(f"   Deseq2 fitting for group {key} failed: {e}")
-                    traceback.print_exc()
+                
+        if not self.ran_dds:
+            self._run_dds(
+                show_progress = show_progress,
+                dds_kwargs = dds_kwargs,
+            )
+        
+        self._run_ds(
+            contrast = contrast,
+            show_progress = show_progress,
+            ds_kwargs = ds_kwargs,
+        )
 
     def run_gsva(self, gsva_kwargs = {}, show_progress = True):
         """
@@ -247,9 +322,10 @@ class GeneAnalyzer():
                     
                 self.gsva_df[key] = pivot
             except Exception as e:
-                print(f"   GSVA fitting failed: {e}")
+                print(f"   GSVA fitting failed for group {key}: {e}")
                 traceback.print_exc()
                 return None
+        self.run_gsva = True
                 
     def fit_gsva(self, fit_kwargs = {}, show_progress = True):
         """
@@ -321,7 +397,15 @@ class GeneAnalyzer():
             if isinstance(contrast, dict):
                 fc = FormulaicContrasts(self.gsva_df[key], f'~ {self.design}')
                 contrast = (fc.cond(**contrast['test']) - fc.cond(**contrast['ref'])).values
-                
+            # If provided as GenericContrast, get the contrast vector
+            elif isinstance(contrast, GenericContrast):
+                fc = FormulaicContrasts(self.gsva_df[key], f'~ {self.design}')
+                conds = {name: fc.cond(**c) for name, c in contrast.conditions.items()}
+                contrast = contrast.op(**conds).values
+            elif isinstance(contrast, list):
+                fc = FormulaicContrasts(self.gsva_df[key], f'~ {self.design}')
+                conds = {'test': {contrast[0] : contrast[1]}, 'ref': {contrast[0]: contrast[2]}}
+                contrast = (fc.cond(**conds['test']) - fc.cond(**conds['ref'])).values
             for pathway in self.gsva_results[key]:
                 
                 # If using likelihood ratios
@@ -369,9 +453,11 @@ class GeneAnalyzer():
             dictionaries defining the test and reference classes        
         """
         out_deseq = self.run_stats_deseq()
-        out_gsva = self.run_stats_gsva(contrast = contrast)
-        
-        out_df = pd.concat([out_deseq, out_gsva], axis = 0, join = 'outer')
+        if len(self.gsva_results) > 0:
+            out_gsva = self.run_stats_gsva(contrast = contrast)
+            out_df = pd.concat([out_deseq, out_gsva], axis = 0, join = 'outer')
+        else:
+            out_df = out_deseq
         self.results_df = out_df.copy()
         return out_df
     
@@ -383,6 +469,7 @@ class GeneAnalyzer():
         ds_kwargs = {},
         gsva_kwargs = {},
         fit_kwargs = {},
+        run_gsva = True,
         show_progress = True,
     ):
         """
@@ -404,6 +491,8 @@ class GeneAnalyzer():
             Keyword arguments for gsva analysis
         fit_kwargs: dict
             Keyword arguments for OLS fitting of GSVA results
+        run_gsva: bool = True
+            Run GSVA analysis, otherwise skip and only run deseq2 analysis
         """
         
         # Sorting out kwargs
@@ -412,10 +501,10 @@ class GeneAnalyzer():
         gsva_kwargs['threads'] = n_jobs if n_jobs is not None else multiprocessing.cpu_count()
         
         self.run_deseq2(show_progress=show_progress, contrast = contrast, dds_kwargs=dds_kwargs, ds_kwargs=ds_kwargs)
-        self.run_gsva(gsva_kwargs=gsva_kwargs, show_progress=show_progress)
+        if run_gsva and not self.run_gsva:
+            self.run_gsva(gsva_kwargs=gsva_kwargs, show_progress=show_progress)
         self.fit_gsva(fit_kwargs=fit_kwargs, show_progress=show_progress)
         return self.run_stats(contrast = contrast)
-
 
     def _shuffle_metadata(self, random_state = None):
         """
@@ -429,19 +518,31 @@ class GeneAnalyzer():
         
         meta = self.adata.obs.copy() if self.metadata is None else self.metadata.copy()
         perm_cols = self.pseudobulk_key + self.comparisons
-        shuffled_meta = meta[perm_cols].drop_duplicates()
-        shuffled_meta['tmp_idx'] = shuffled_meta.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
-        shuffled_meta = shuffled_meta.sort_values('tmp_idx')
+        meta = meta[perm_cols].copy()
         
-        rng = np.random.default_rng(random_state)
-        shuffle_dict = dict(zip(shuffled_meta['tmp_idx'], rng.permutation(shuffled_meta['tmp_idx'])))
-        shuffled_meta['tmp_idx'] = shuffled_meta['tmp_idx'].map(shuffle_dict)
+        def _shuffle_df(df, perm_cols, random_state = None):
+            shuffled_df = df[perm_cols].drop_duplicates()
+            shuffled_df['tmp_idx'] = shuffled_df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
         
+            rng = np.random.default_rng(random_state)
+            shuffle_dict = dict(zip(shuffled_df['tmp_idx'], rng.permutation(shuffled_df['tmp_idx'])))
+            shuffled_df['tmp_idx'] = shuffled_df['tmp_idx'].map(shuffle_dict)
+            
+            return shuffled_df
+        
+        if self.stratify_by:
+            for x in self.stratify_by:
+                if x in perm_cols:
+                    perm_cols.remove(x)
+            meta = meta.groupby(self.stratify_by, group_keys = False).apply(lambda g: _shuffle_df(g, perm_cols = perm_cols, random_state=random_state), include_groups = True)
+        else:
+            meta = _shuffle_df(meta, perm_cols, random_state=random_state)
+
         df = self.adata.obs.copy()
         df['tmp_idx'] = df.apply(lambda x: '_'.join(str(x[c]) for c in perm_cols), axis = 1)
         df = df.drop(columns = perm_cols)
         
-        df = df.merge(shuffled_meta, on = 'tmp_idx', how = 'right').set_index(df.index)
+        df = df.merge(meta, on = 'tmp_idx', how = 'left').set_index(df.index)
         df = df.drop(columns = ['tmp_idx'])
 
         return df
@@ -454,10 +555,11 @@ class GeneAnalyzer():
         ds_kwargs = {},
         gsva_kwargs = {},
         fit_kwargs = {},
-        random_state = None
+        run_gsva = True,
+        random_state = None,
     ):
         """
-        Run analysis for single permutation
+        Run analysis for single permutation.
         
         Parameters:
         -----------
@@ -475,7 +577,20 @@ class GeneAnalyzer():
             Keyword arguments for gsva analysis
         fit_kwargs: dict
             Keyword arguments for OLS fitting of GSVA results
+        run_gsva: bool
+            Flag to run GSVA analysis
         """
+        
+        if not self.is_grouped:
+            self.run_analysis(
+                contrast = contrast,
+                dds_kwargs = dds_kwargs,
+                ds_kwargs = ds_kwargs,
+                gsva_kwargs = gsva_kwargs,
+                fit_kwargs = fit_kwargs,
+                run_gsva = run_gsva,
+            )
+        
         adata = self.adata.copy()
         shuffled = self._shuffle_metadata(random_state = random_state)
         adata.obs = shuffled
@@ -491,17 +606,23 @@ class GeneAnalyzer():
                 skip = self.skip,
                 design = self.design,
                 design_null = self.design_null,
-                gene_set = self.gene_set
+                gene_set = self.gene_set,
+                layer = 'sum',
             )
             
             dds_kwargs['n_cpus'] = n_jobs if n_jobs is not None else multiprocessing.cpu_count()
             ds_kwargs['n_cpus'] = n_jobs if n_jobs is not None else multiprocessing.cpu_count()
             gsva_kwargs['threads'] = n_jobs if n_jobs is not None else multiprocessing.cpu_count()
             
-            GA.run_deseq2(contrast = contrast, show_progress=False, dds_kwargs=dds_kwargs, ds_kwargs=ds_kwargs)
-            GA.run_gsva(show_progress=False, gsva_kwargs=gsva_kwargs)
-            GA.fit_gsva(show_progress=False, fit_kwargs=fit_kwargs)
-            return GA.run_stats(contrast = contrast)
+            return GA.run_analysis(
+                contrast = contrast,
+                dds_kwargs = dds_kwargs,
+                ds_kwargs = ds_kwargs,
+                gsva_kwargs = gsva_kwargs,
+                fit_kwargs = fit_kwargs,
+                run_gsva = run_gsva,
+                show_progress = False,
+            )
         
         except Exception as e:
             print(f"   Permutation fitting failed: {e}")
@@ -515,6 +636,7 @@ class GeneAnalyzer():
         ds_kwargs = {},
         gsva_kwargs = {},
         fit_kwargs = {},
+        run_gsva = True,
         n_permutations = 1000,
         n_jobs = None,
         random_state = None,
@@ -531,6 +653,7 @@ class GeneAnalyzer():
                 ds_kwargs = ds_kwargs,
                 gsva_kwargs = gsva_kwargs,
                 fit_kwargs = fit_kwargs,
+                run_gsva = run_gsva,
                 n_jobs = 1,
                 random_state = i + random_state if random_state is not None else random_state
             ) for i in range(n_permutations)]
@@ -549,6 +672,7 @@ class GeneAnalyzer():
                 ds_kwargs = ds_kwargs,
                 gsva_kwargs = gsva_kwargs,
                 fit_kwargs = fit_kwargs,
+                run_gsva = run_gsva,
                 random_state = i + random_state if random_state is not None else random_state
             ) for i in tqdm(range(n_permutations), desc = "Calculating permutations")]
 
@@ -570,6 +694,7 @@ class GeneAnalyzer():
         ds_kwargs = {},
         gsva_kwargs = {},
         fit_kwargs = {},
+        run_gsva = True,
         n_permutations = 1000,
         n_jobs = None,
         random_state = None,
@@ -591,6 +716,8 @@ class GeneAnalyzer():
             Keyword arguments for gseapy.gsva()
         fit_kwargs: dict
             Keyword arguments for OLS fitting
+        run_gsva: bool
+            Flag to run GSVA analysis (default = True)
         n_permutations: int
             Number of permutations to generate null distribution
         n_jobs: int | None
@@ -606,7 +733,8 @@ class GeneAnalyzer():
             dds_kwargs = dds_kwargs,
             ds_kwargs = ds_kwargs,
             gsva_kwargs = gsva_kwargs,
-            fit_kwargs=fit_kwargs,
+            fit_kwargs = fit_kwargs,
+            run_gsva = run_gsva,
             show_progress = show_progress) if self.results_df is None else self.results_df
         
         perm_res = self._run_permutations(
@@ -615,6 +743,7 @@ class GeneAnalyzer():
             ds_kwargs = ds_kwargs,
             gsva_kwargs = gsva_kwargs,
             fit_kwargs = fit_kwargs,
+            run_gsva = run_gsva,
             n_permutations = n_permutations,
             n_jobs = n_jobs,
             random_state = random_state,
