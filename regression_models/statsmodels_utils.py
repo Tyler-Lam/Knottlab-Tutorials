@@ -48,6 +48,7 @@ from pydeseq2.ds import DeseqStats
 import gseapy as gp
 
 import gc
+from glob import glob
 
 # Stackoverflow solution to make tqdm work with joblib.Parallel
 # https://stackoverflow.com/questions/24983493/tracking-progress-of-joblib-parallel-execution/58936697#58936697
@@ -759,46 +760,71 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     scores = []
 
     # For testing, use 100 log-uniform thresholds from [0.001, 0.1] and 100 bins from (.1, max(threshold)]
-    thresholds_all = np.concat([np.logspace(-3, -1, 100), np.linspace(.1, np.max(Z[:,2]), 100)[1:]])
+    thresholds_all = np.concatenate([np.logspace(-3, -1, 100), np.linspace(.1, np.max(Z[:,2]), 100)[1:]])
 
-    def get_silhouette_score(Z, t, dist, max_clusters, batch_size = None, random_state = None):
+    def get_silhouette_score(Z, t, dist, batch_size = None, random_state = None):
         """
         Given linkage Z, threshold t, distance matrix dist, and a max number of clusters,
         return the cluster labels, silhouette score, and threshold
         """
+        
+        rng = np.random.default_rng(random_state)
         labels = fcluster(Z, t = t, criterion = 'distance')
-        n_clusters = len(np.unique(labels))
         
-        if n_clusters <= 1 or n_clusters >= max_clusters:
+        # Get the information needed for random sampling:
+        unique, counts = np.unique(labels, return_counts = True)
+        indices_all = np.arange(len(labels))
+        if len(unique) < 2 or sum(counts > 1) == 0:
             return None
+        # Clusters with > 1 element
+        multiplets = unique[counts > 1]
         
+        min_samples = max(1, int(len(labels) / batch_size) + 1)
         if batch_size is not None:
             scores = []
             
-            # Repeat sampling until standard error on the mean is < .01
-            SEM = 1
-            while SEM > .01 and len(scores) < 10:
+            # Repeat sampling for at least 10 iterations until relative standard error on the mean is < .01
+            relSEM = 1
+            while relSEM > .01 and len(scores) < 10:
+                # We have to do our own random sampling since silhouette_score's sample_size is poorly implemented
+                # The default randomly picks indices, but in extreme cases (e.g. only 2 clusters) all sampled
+                # points can be from the same cluster, which raises an error
+                indices = []
+                # Get at least two points from one cluster
+                multiplet_cluster = rng.choice(multiplets)
+                multiplet_idx = rng.choice(indices_all[labels == multiplet_cluster], 2, replace = False)
+                indices.extend(multiplet_idx)
+                
+                # Get at least one point from another cluster
+                other_idx = rng.choice(indices_all[labels != multiplet_cluster])
+                indices.append(other_idx)
+                
+                # Sample remaining points from all other indices
+                other_indices = list(set(indices_all) - set(indices))
+                indices.extend(rng.choice(other_indices, batch_size - 3, replace = False))
+                
                 scores.append(
                     silhouette_score(
-                        dist,
-                        label = labels,
+                        dist[indices][:,indices],
+                        labels = labels[indices],
                         metric = 'precomputed',
-                        sample_size = batch_size,
-                        random_state = random_state + len(scores) if random_state is not None else random_state)
+                    )
                 )
-                se = np.std(scores) / np.sqrt(len(scores))
-                SEM = se / np.mean(scores)
+                if len(scores) >= min_samples:
+                    se = np.std(scores) / np.sqrt(len(scores))
+                    relSEM = se / np.mean(scores)
+            print(len(scores))
             score = np.mean(scores)
         else:
             score = silhouette_score(dist, labels = labels, metric = 'precomputed', sample_size = batch_size, random_state = random_state)
         return (labels, score, t)
-
+    
     if n_jobs is None:
         n_jobs = multiprocessing.cpu_count() - 1
     if n_jobs > 1:
         tasks = [delayed(
             get_silhouette_score)(
-                Z, t, dist, len(dist), batch_size = silhouette_batch_size, random_state = random_state
+                Z, t, dist, batch_size = silhouette_batch_size, random_state = random_state
             ) for t in thresholds_all
         ]
         
@@ -807,7 +833,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     else:
         results = [
             get_silhouette_score(
-                Z, t, dist, len(dist), batch_size = silhouette_batch_size, random_state=random_state
+                Z, t, dist, batch_size = silhouette_batch_size, random_state=random_state
             ) for t in tqdm(thresholds_all, desc = "Calculating silhouette scores")
         ]
         
