@@ -43,9 +43,9 @@ from statsmodels.genmod.generalized_linear_model import GLMResults
 from statannotations.Annotator import Annotator
 
 import scanpy as sc
-from pydeseq2.dds import DeseqDataSet
-from pydeseq2.ds import DeseqStats
-import gseapy as gp
+#from pydeseq2.dds import DeseqDataSet
+#from pydeseq2.ds import DeseqStats
+#import gseapy as gp
 
 import gc
 from glob import glob
@@ -587,7 +587,7 @@ def get_empirical_pvalues(df, perm_df, stat_col = 'stat', col_to_add = 'p-nom'):
 # Using numba loops is much faster than scipy.spearmanr for each pair of features
 from numba import njit, prange
 @njit(parallel = True)
-def fast_corr(X, pbar = None):
+def fast_corr(X, pbar = None, min_counts = 2):
     n, m = X.shape
     res = np.empty((m, m), dtype = np.float32)
     
@@ -605,7 +605,7 @@ def fast_corr(X, pbar = None):
                     xi += X[k,i]
                     xj += X[k,j]
                     count += 1
-            if count < 2:
+            if count < min_counts:
                 res[i, j] = np.nan
                 res[j, i] = np.nan
             mean_i = xi / count
@@ -644,44 +644,18 @@ def apply_fdr(df, pval_col = 'p-nom', out_col = 'cluster-p-adj'):
     df[out_col] = false_discovery_control(df[pval_col])
     return df
 
-# Run Benjamini Bogomolov selection by clustering based on permutations
-def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, stat_col = 'stat', pval_col = 'p-nom', nan_behavior = 'omit', n_jobs = None, silhouette_batch_size = None, random_state = None):
-    """
-    Run benjamini bogomolov FDR correction by clustering features by spearman correlation across permutations
-    
-    Parameters:
-    ------------
-    perm_df: pd.DataFrame
-        permutation dataframe. Must have a 'feature', 'stat', and 'perm_iter' column
-    llr_df: pd.DataFRame
-        Log likelihood-ratio dataframe
-    alpha: float
-        significance threshold, defaults to 0.05
-    plot_threshold: bool
-        Plot silhouette score vs threshold for clustering
-    stat_col: str
-        Column for test statistic
-    nan_behavior: 'omit' | 'zero'
-        How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
-        "omit" removes features (starting from highest nan counts) until no nans remain
-        "zero" replaces nans with 0. This is much faster, but should only be used if you are sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
-    n_jobs: int | None
-        Number of jobs for calculating clustering threshold from silhouette scores.
-        If None, default to ncpus - 1
-    silhouette_batch_size: int | None
-        Batch size for silhouette score calculation. If none, calculate on entire linkage matrix
-    random_state: int | None
-        Random seed for batch sampling of silhouette score
-    """
+def get_feature_linkage(
+    perm_df,
+    stat_col = 'stat',
+    nan_behavior = 'omit',
+):
     t_start = time.time()
     print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
-    # Filter the permutation df to only use features in the llr df
-    sub_perm_df = perm_df[perm_df.index.isin(llr_df.index)]
-    
+
     t0 = time.time()
     print("Ranking test statistics ... ", end = "")
     # Make the pivot table and rank dataframe
-    pivot = sub_perm_df.reset_index().pivot(index = 'perm_iter', columns = sub_perm_df.index.name, values = stat_col)
+    pivot = perm_df.reset_index().pivot(index = 'perm_iter', columns = perm_df.index.name, values = stat_col)
     ranks = pivot.rank(axis = 0)
     del pivot
     gc.collect()
@@ -746,11 +720,61 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # Make distance matrix and calculate linkage
     print("   Calculating Distance and linkage matrix ... ", end = "")
     dist = 1 - corr
-    del corr
     gc.collect()
     dist_condensed = squareform(dist)
     Z = linkage(dist_condensed, method = 'average') 
     print(f"done: {(time.time() - t0) / 60:.2f} min")
+    #corr_df = pd.DataFrame(corr, index = ranks.columns[mask_to_keep], columns = ranks.columns[mask_to_keep])
+    return Z, dist, ranks, mask_to_keep
+
+# Run Benjamini Bogomolov selection by clustering based on permutations
+def run_fdr_corrections(
+    perm_df,
+    llr_df,
+    alpha = 0.05,
+    plot_threshold = False,
+    stat_col = 'stat',
+    pval_col = 'p-nom',
+    nan_behavior = 'omit',
+    n_jobs = None,
+    silhouette_batch_size = None,
+    silhouette_max_iter = 5,
+    random_state = None):
+    """
+    Run benjamini bogomolov FDR correction by clustering features by spearman correlation across permutations
+    
+    Parameters:
+    ------------
+    perm_df: pd.DataFrame
+        permutation dataframe. Must have a 'feature', 'stat', and 'perm_iter' column
+    llr_df: pd.DataFRame
+        Log likelihood-ratio dataframe
+    alpha: float
+        significance threshold, defaults to 0.05
+    plot_threshold: bool
+        Plot silhouette score vs threshold for clustering
+    stat_col: str
+        Column for test statistic
+    nan_behavior: 'omit' | 'zero'
+        How nans are handled in the correlation matrix. Must be 'omit' or 'zero'.
+        "omit" removes features (starting from highest nan counts) until no nans remain
+        "zero" replaces nans with 0. This is much faster, but should only be used if you are absolutely sure the nans are due to lack of pairwise entries and are not expected to be correlated, not due to true 0 variance in the correlation
+    n_jobs: int | None
+        Number of jobs for calculating clustering threshold from silhouette scores.
+        If None, default to ncpus - 1
+    silhouette_batch_size: int | None
+        Batch size for silhouette score calculation. If none, calculate on entire linkage matrix
+    silhouette_max_iter: int | None
+        Maximum iterations for repeated sampleing if using silhouette_batch_size
+    random_state: int | None
+        Random seed for batch sampling of silhouette score
+    """
+    
+    t_start = time.time()
+    print("Running Benjamini-Bogomolov selection criteria based on permutation clusters")
+    # Filter the permutation df to only use features in the llr df
+    sub_perm_df = perm_df[perm_df.index.isin(llr_df.index)]
+    Z, dist, ranks, mask_to_keep = get_feature_linkage(sub_perm_df, stat_col = stat_col, nan_behavior = nan_behavior)
 
     # Calculate best threshold for clustering:
     best_labels = []
@@ -762,7 +786,7 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     # For testing, use 100 log-uniform thresholds from [0.001, 0.1] and 100 bins from (.1, max(threshold)]
     thresholds_all = np.concatenate([np.logspace(-3, -1, 100), np.linspace(.1, np.max(Z[:,2]), 100)[1:]])
 
-    def get_silhouette_score(Z, t, dist, batch_size = None, random_state = None):
+    def get_silhouette_score(Z, t, dist, batch_size = None, max_iter = None, random_state = None):
         """
         Given linkage Z, threshold t, distance matrix dist, and a max number of clusters,
         return the cluster labels, silhouette score, and threshold
@@ -771,21 +795,20 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
         rng = np.random.default_rng(random_state)
         labels = fcluster(Z, t = t, criterion = 'distance')
         
-        # Get the information needed for random sampling:
         unique, counts = np.unique(labels, return_counts = True)
-        indices_all = np.arange(len(labels))
-        if len(unique) < 2 or sum(counts > 1) == 0:
-            return None
         # Clusters with > 1 element
         multiplets = unique[counts > 1]
-        
-        min_samples = max(1, int(len(labels) / batch_size) + 1)
+        indices_all = np.arange(len(labels))
+        if len(unique) < 2 or len(multiplets) == 0:
+            return None
+
         if batch_size is not None:
             scores = []
-            
-            # Repeat sampling for at least 10 iterations until relative standard error on the mean is < .01
+            min_samples = min(max_iter, max(5, int(len(labels) / batch_size) + 1))
+
+            # Repeat sampling until relative standard error on the mean is < .01
             relSEM = 1
-            while relSEM > .01 and len(scores) < 10:
+            while relSEM > .01:
                 # We have to do our own random sampling since silhouette_score's sample_size is poorly implemented
                 # The default randomly picks indices, but in extreme cases (e.g. only 2 clusters) all sampled
                 # points can be from the same cluster, which raises an error
@@ -813,7 +836,9 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
                 if len(scores) >= min_samples:
                     se = np.std(scores) / np.sqrt(len(scores))
                     relSEM = se / np.mean(scores)
-            print(len(scores))
+                if max_iter is not None:
+                    if len(scores) > max_iter:
+                        break
             score = np.mean(scores)
         else:
             score = silhouette_score(dist, labels = labels, metric = 'precomputed', sample_size = batch_size, random_state = random_state)
@@ -824,17 +849,17 @@ def run_fdr_corrections(perm_df, llr_df, alpha = 0.05, plot_threshold = False, s
     if n_jobs > 1:
         tasks = [delayed(
             get_silhouette_score)(
-                Z, t, dist, batch_size = silhouette_batch_size, random_state = random_state
+                Z, t, dist, batch_size = silhouette_batch_size, max_iter = silhouette_max_iter, random_state = random_state
             ) for t in thresholds_all
         ]
         
-        with tqdm_joblib(tqdm(desc = "Calculating silhouette scores", total = len(tasks))) as pbar:
+        with tqdm_joblib(tqdm(desc = "   Calculating silhouette scores", total = len(tasks))) as pbar:
             results = Parallel(n_jobs = n_jobs)(tasks)
     else:
         results = [
             get_silhouette_score(
-                Z, t, dist, batch_size = silhouette_batch_size, random_state=random_state
-            ) for t in tqdm(thresholds_all, desc = "Calculating silhouette scores")
+                Z, t, dist, batch_size = silhouette_batch_size, max_iter = silhouette_max_iter, random_state=random_state
+            ) for t in tqdm(thresholds_all, desc = "  Calculating silhouette scores")
         ]
         
     for res in results:

@@ -93,13 +93,14 @@ def _run_single_comparison(res, c, name):
     x = res.model.exog
     
     # Jank way of making the contrast vectors consistent with the models
+    # I'm 100% sure there's a way more efficient and robust way to do this
     idx_c = set(c.index.values)
     # Make sure coefficients are actually in the model and haven't been removed due to low statistics
     idx_c_new = [x for x in res.model.exog_names if x in idx_c] 
     c = c[idx_c_new]
     
-    # If the result is not converged
-    if np.isnan(res.bse).any() or not res.mle_retvals['converged']:
+    # If the result is not converged or if the contrast has any nonzero values
+    if np.isnan(res.bse).any() or not res.mle_retvals['converged'] or (c==0).all():
         return (np.nan, np.nan, np.nan, np.nan, name)
     # If the comparison contains categories that were removed from the given model
     if not idx_c.issubset(set(res.model.exog_names)):
@@ -301,6 +302,7 @@ class GLMCollection():
             Dictionary of cell types to skip (see _parse_feature_name method)
         stratify_col: str | List[str] | None
             Column(s) for stratification removal. If a category sharing this column is removed, all categories with this column are removed
+            Example: stratify_col = 'Diagnosis' for a diagnosis stage vs HPV status. If a diagnosis stage has 0 patients in one HPV status, remove that diagnosis stage completely
         min_counts: int
             Minimum number of nonzero values per cohort
         """
@@ -344,7 +346,6 @@ class GLMCollection():
                 counts_col = meta['counts_col']
                 # --- A. Construct feature-specific aggregated DataFrame ---
                 agg_df = pd.DataFrame(self.agg_features[counts_col]).rename(columns={counts_col: 'counts'})
-                
                 # Require categories to have >= min_counts patients with nonzero counts
                 nonzero = agg_df.groupby(self.comparisons)['counts'].apply(lambda x: sum(x > 0)) >= min_counts
                 if self.stratify_by is not None:
@@ -363,7 +364,7 @@ class GLMCollection():
                     totals_col = meta['totals_col']
                     agg_df['total_counts'] = self.agg_features[totals_col]
                     agg_df = agg_df[agg_df['total_counts'] > 0].copy()
-                    agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
+                    agg_df = agg_df.reset_index().merge(valid[self.comparisons], on = self.comparisons, how = "inner").set_index(self.group_key + self.comparisons)
                     if agg_df.empty: 
                         warnings.warn(f'Category {val_col} has 0 nonzero total counts. Skipping model.', UserWarning)
                         for warn in w:
@@ -377,7 +378,9 @@ class GLMCollection():
                     scale_col = meta['scale_col']
                     agg_df['scale'] = self.agg_features[scale_col]
                     agg_df = agg_df[agg_df['scale'] > 0].copy()
-                    agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
+                    #agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
+                    agg_df = agg_df.reset_index().merge(valid[self.comparisons], on = self.comparisons, how = "inner").set_index(self.group_key + self.comparisons)
+
                     if agg_df.empty: 
                         warnings.warn(f'Category {val_col} has 0 nonzero total counts. Skipping model.', UserWarning)
                         for warn in w:
@@ -393,7 +396,9 @@ class GLMCollection():
                     scale_col = meta['scale_col']
                     agg_df['scale'] = self.agg_features[scale_col]
                     agg_df = agg_df[agg_df['scale'] > 0].copy()
-                    agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
+                    #agg_df = agg_df.merge(valid, on = self.comparisons, how = 'inner')
+                    agg_df = agg_df.reset_index().merge(valid[self.comparisons], on = self.comparisons, how = "inner").set_index(self.group_key + self.comparisons)
+
                     if agg_df.empty: 
                         warnings.warn(f'Category {val_col} has 0 nonzero total counts. Skipping model.', UserWarning)
                         for warn in w:
@@ -401,7 +406,7 @@ class GLMCollection():
                         continue
                     agg_df['rate'] = (agg_df['counts'] / agg_df['scale'])
                     agg_df.loc[agg_df['counts'] == 0, 'rate'] = agg_df.loc[agg_df['counts'] > 0]['rate'].min()
-                    
+
                 agg_df.reset_index(inplace=True)
                 agg_df['classification'] = agg_df.apply(lambda x: '___'.join([f'{c}__{x[c]}' for c in self.comparisons]), axis=1)
 

@@ -1,4 +1,7 @@
 from statsmodels_utils import *
+from pydeseq2.dds import DeseqDataSet
+from pydeseq2.ds import DeseqStats
+import gseapy as gp
 
 class GeneAnalyzer():
     def __init__(
@@ -325,7 +328,6 @@ class GeneAnalyzer():
                 print(f"   GSVA fitting failed for group {key}: {e}")
                 traceback.print_exc()
                 return None
-        self.run_gsva = True
                 
     def fit_gsva(self, fit_kwargs = {}, show_progress = True):
         """
@@ -501,7 +503,7 @@ class GeneAnalyzer():
         gsva_kwargs['threads'] = n_jobs if n_jobs is not None else multiprocessing.cpu_count()
         
         self.run_deseq2(show_progress=show_progress, contrast = contrast, dds_kwargs=dds_kwargs, ds_kwargs=ds_kwargs)
-        if run_gsva and not self.run_gsva:
+        if run_gsva:
             self.run_gsva(gsva_kwargs=gsva_kwargs, show_progress=show_progress)
         self.fit_gsva(fit_kwargs=fit_kwargs, show_progress=show_progress)
         return self.run_stats(contrast = contrast)
